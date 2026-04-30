@@ -949,6 +949,8 @@ void collectFilesSPIFFSFlat(std::vector<String>& files) {
       Serial.printf("[WebServer]   Found file: %s\n", entry.name());
       files.push_back(String(entry.name()));
     }
+    // Close before advancing — required to free the file handle
+    entry.close();
     entry = root.openNextFile();
   }
 
