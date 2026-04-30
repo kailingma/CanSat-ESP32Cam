@@ -85,6 +85,8 @@ WebServer server(80);
 bool webServerRunning = false;
 
 // WiFi AP credentials
+// NOTE: Change AP_PASSWORD to a stronger value before deploying in the field.
+// The default "12345678" is intentionally simple for first-time setup only.
 static const char* AP_SSID     = "ESP32-CAM-Browser";
 static const char* AP_PASSWORD = "12345678";
 
@@ -889,24 +891,13 @@ void simulateCapture() {
 }
 
 // ============================================================================
-// WEB SERVER - FILE METADATA
-// ============================================================================
-
-// Holds the full path and byte-size of a single file on storage.
-// Populated during directory traversal so each file is opened only once.
-struct FileInfo {
-  String path;   // Absolute path from root (e.g. "/run01/photo.jpg")
-  size_t size;   // File size in bytes
-};
-
-// ============================================================================
 // WEB SERVER - FILE COLLECTION HELPERS
 // ============================================================================
 
-// Recursively walks an SD card directory tree and appends every regular file
-// (with its size) to 'files'.  Each file is opened exactly once so the size
-// is read during the same traversal — no second open is needed later.
-void collectFilesRecursive(const char* dirPath, std::vector<FileInfo>& files) {
+// Recursively collects every file path from an SD card directory into a vector.
+// entry.name() returns only the basename on ESP32 SD, so the parent path is
+// prepended here — the same convention used by listFilesSDCard().
+void collectFilesRecursive(const char* dirPath, std::vector<String>& files) {
   Serial.printf("[WebServer] Scanning SD directory: %s\n", dirPath);
 
   File dir = SD.open(dirPath);
@@ -917,9 +908,7 @@ void collectFilesRecursive(const char* dirPath, std::vector<FileInfo>& files) {
 
   File entry = dir.openNextFile();
   while (entry) {
-    // ---- Build Absolute Path ----
-    // entry.name() returns only the basename on ESP32 SD, so we must
-    // prepend the parent path ourselves (same logic as listFilesSDCard).
+    // Build the full absolute path from the parent path and the basename
     String fullPath;
     if (strcmp(dirPath, "/") == 0) {
       fullPath = String("/") + entry.name();
@@ -928,18 +917,12 @@ void collectFilesRecursive(const char* dirPath, std::vector<FileInfo>& files) {
     }
 
     if (entry.isDirectory()) {
-      // ---- Recurse into Subdirectory ----
       Serial.printf("[WebServer]   Entering directory: %s\n", fullPath.c_str());
       entry.close();
       collectFilesRecursive(fullPath.c_str(), files);
     } else {
-      // ---- Record File (size read now — no second open later) ----
-      FileInfo info;
-      info.path = fullPath;
-      info.size = entry.size();
-      Serial.printf("[WebServer]   Found file: %s  (%u bytes)\n",
-                    info.path.c_str(), (unsigned)info.size);
-      files.push_back(info);
+      Serial.printf("[WebServer]   Found file: %s\n", fullPath.c_str());
+      files.push_back(fullPath);
       entry.close();
     }
 
@@ -949,10 +932,9 @@ void collectFilesRecursive(const char* dirPath, std::vector<FileInfo>& files) {
   dir.close();
 }
 
-// Collects every file in SPIFFS (flat filesystem) into 'files'.
-// SPIFFS's entry.name() already returns the full path (e.g. "/photo.jpg"),
-// and size is read here so no second open is needed in the JSON builder.
-void collectFilesSPIFFSFlat(std::vector<FileInfo>& files) {
+// Collects every file path from SPIFFS.
+// SPIFFS entry.name() already returns the full absolute path (e.g. "/photo.jpg").
+void collectFilesSPIFFSFlat(std::vector<String>& files) {
   Serial.println("[WebServer] Scanning SPIFFS filesystem...");
 
   File root = SPIFFS.open("/");
@@ -964,12 +946,8 @@ void collectFilesSPIFFSFlat(std::vector<FileInfo>& files) {
   File entry = root.openNextFile();
   while (entry) {
     if (!entry.isDirectory()) {
-      FileInfo info;
-      info.path = String(entry.name());   // Already absolute (e.g. "/data.txt")
-      info.size = entry.size();
-      Serial.printf("[WebServer]   Found file: %s  (%u bytes)\n",
-                    info.path.c_str(), (unsigned)info.size);
-      files.push_back(info);
+      Serial.printf("[WebServer]   Found file: %s\n", entry.name());
+      files.push_back(String(entry.name()));
     }
     entry = root.openNextFile();
   }
@@ -977,320 +955,66 @@ void collectFilesSPIFFSFlat(std::vector<FileInfo>& files) {
   root.close();
 }
 
-// Builds a JSON array describing all files on the active storage backend.
-// Uses FileInfo structs so every file is opened at most once during collection.
-// Format: [{"name":"photo.jpg","path":"/run01/photo.jpg","size":45678}, ...]
-String generateFileListJSON() {
-  std::vector<FileInfo> files;
+// ============================================================================
+// WEB SERVER - ROUTE HANDLERS
+// ============================================================================
 
-  // ---- Collect File Metadata (one pass, one open per file) ----
+// Serves a plain, unformatted HTML page that lists every file on storage
+// and provides a link to the live snapshot page.
+void handleHomePage() {
+  Serial.println("[WebServer] Home page requested — collecting file list...");
+
+  // Collect all file paths from whichever storage backend is active
+  std::vector<String> files;
   if (currentStorage == STORAGE_SD_CARD) {
     collectFilesRecursive("/", files);
   } else if (currentStorage == STORAGE_SPIFFS) {
     collectFilesSPIFFSFlat(files);
   }
 
-  Serial.printf("[WebServer] Total files found: %u\n", (unsigned)files.size());
+  Serial.printf("[WebServer] Sending file list: %u file(s)\n", (unsigned)files.size());
 
-  // ---- Serialize to JSON ----
-  String json = "[";
-  for (size_t i = 0; i < files.size(); i++) {
-    if (i > 0) json += ",";
-
-    const String& path = files[i].path;
-
-    // Derive display name from the last path component
-    String name = path;
-    int lastSlash = path.lastIndexOf('/');
-    if (lastSlash >= 0) name = path.substring(lastSlash + 1);
-
-    json += "{\"name\":\"" + name
-          + "\",\"path\":\"" + path
-          + "\",\"size\":"  + String(files[i].size)
-          + "}";
+  // Build a minimal HTML page — no CSS, no JavaScript, no formatting
+  String html = "<!DOCTYPE html><html><body>\n";
+  html += "<p>Files on storage (" + String(files.size()) + "):</p>\n";
+  html += "<pre>\n";
+  for (const String& path : files) {
+    html += path + "\n";
   }
-  json += "]";
-
-  return json;
-}
-
-// ============================================================================
-// WEB SERVER - ROUTE HANDLERS
-// ============================================================================
-
-// Returns the MIME type string for a given file path based on its extension.
-String getMimeType(const String& path) {
-  if (path.endsWith(".jpg") || path.endsWith(".jpeg")) return "image/jpeg";
-  if (path.endsWith(".png"))  return "image/png";
-  if (path.endsWith(".gif"))  return "image/gif";
-  if (path.endsWith(".html") || path.endsWith(".htm")) return "text/html";
-  if (path.endsWith(".css"))  return "text/css";
-  if (path.endsWith(".js"))   return "application/javascript";
-  if (path.endsWith(".json")) return "application/json";
-  if (path.endsWith(".txt"))  return "text/plain";
-  if (path.endsWith(".csv"))  return "text/plain";
-  return "application/octet-stream";
-}
-
-// Serves the single-page file browser UI.
-// The entire page is a single self-contained HTML document with embedded
-// CSS and JavaScript so no external resources are required.
-void handleHomePage() {
-  Serial.println("[WebServer] Serving home page to client");
-
-  String html = R"rawhtml(<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ESP32-CAM File Browser</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: 'Segoe UI', Arial, sans-serif; background: #f0f2f5; }
-  header {
-    background: linear-gradient(135deg, #1a237e, #283593);
-    color: #fff;
-    padding: 20px 24px;
-    display: flex;
-    align-items: center;
-    gap: 12px;
-  }
-  header h1 { font-size: 1.4rem; font-weight: 600; }
-  header span { font-size: 2rem; }
-  #status { font-size: 0.8rem; opacity: 0.8; margin-top: 4px; }
-  main { max-width: 900px; margin: 24px auto; padding: 0 16px; }
-  #file-list { background: #fff; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,.12); overflow: hidden; }
-  .file-item {
-    display: flex;
-    align-items: center;
-    padding: 14px 20px;
-    border-bottom: 1px solid #f0f0f0;
-    gap: 12px;
-    transition: background .15s;
-  }
-  .file-item:last-child { border-bottom: none; }
-  .file-item:hover { background: #f5f7ff; }
-  .file-icon { font-size: 1.6rem; min-width: 32px; text-align: center; }
-  .file-info { flex: 1; min-width: 0; }
-  .file-name { font-weight: 500; font-size: 0.95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .file-meta { font-size: 0.78rem; color: #888; margin-top: 2px; }
-  .actions { display: flex; gap: 8px; flex-shrink: 0; }
-  .btn {
-    padding: 6px 14px;
-    border: none;
-    border-radius: 6px;
-    cursor: pointer;
-    font-size: 0.82rem;
-    font-weight: 500;
-    transition: opacity .15s;
-  }
-  .btn:hover { opacity: 0.85; }
-  .btn-preview { background: #e3f2fd; color: #1565c0; }
-  .btn-download { background: #e8f5e9; color: #2e7d32; }
-  #preview-overlay {
-    display: none;
-    position: fixed;
-    inset: 0;
-    background: rgba(0,0,0,.7);
-    z-index: 100;
-    align-items: center;
-    justify-content: center;
-  }
-  #preview-overlay.active { display: flex; }
-  #preview-box {
-    background: #fff;
-    border-radius: 12px;
-    max-width: 90vw;
-    max-height: 90vh;
-    overflow: auto;
-    padding: 20px;
-    position: relative;
-  }
-  #preview-box img { max-width: 100%; display: block; }
-  #preview-box pre { white-space: pre-wrap; word-break: break-all; font-size: 0.85rem; }
-  #close-preview {
-    position: absolute;
-    top: 10px;
-    right: 14px;
-    background: none;
-    border: none;
-    font-size: 1.5rem;
-    cursor: pointer;
-    color: #555;
-  }
-  #empty { text-align: center; padding: 40px; color: #aaa; font-size: 1rem; }
-</style>
-</head>
-<body>
-<header>
-  <span>&#128247;</span>
-  <div>
-    <h1>ESP32-CAM File Browser</h1>
-    <div id="status">Loading files&hellip;</div>
-  </div>
-</header>
-<main>
-  <div id="file-list"><div id="empty">Loading&hellip;</div></div>
-</main>
-<div id="preview-overlay">
-  <div id="preview-box">
-    <button id="close-preview" title="Close">&times;</button>
-    <div id="preview-content"></div>
-  </div>
-</div>
-<script>
-  const imageExts = ['jpg','jpeg','png','gif'];
-  const textExts  = ['txt','csv','json','log','md','html','htm','css','js'];
-
-  function ext(name) { return name.split('.').pop().toLowerCase(); }
-
-  function fileIcon(name) {
-    const e = ext(name);
-    if (imageExts.includes(e)) return '&#128444;';
-    if (textExts.includes(e))  return '&#128196;';
-    return '&#128190;';
-  }
-
-  function fmtSize(b) {
-    if (b < 1024) return b + ' B';
-    if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
-    return (b/1048576).toFixed(2) + ' MB';
-  }
-
-  function canPreview(name) {
-    const e = ext(name);
-    return imageExts.includes(e) || textExts.includes(e);
-  }
-
-  function previewFile(path, name) {
-    const e = ext(name);
-    const overlay = document.getElementById('preview-overlay');
-    const content = document.getElementById('preview-content');
-    content.innerHTML = '';
-    if (imageExts.includes(e)) {
-      const img = document.createElement('img');
-      img.src = '/download?path=' + encodeURIComponent(path);
-      content.appendChild(img);
-    } else {
-      fetch('/download?path=' + encodeURIComponent(path))
-        .then(r => r.text())
-        .then(t => {
-          const pre = document.createElement('pre');
-          pre.textContent = t;
-          content.appendChild(pre);
-        });
-    }
-    overlay.classList.add('active');
-  }
-
-  document.getElementById('close-preview').addEventListener('click', () => {
-    document.getElementById('preview-overlay').classList.remove('active');
-  });
-  document.getElementById('preview-overlay').addEventListener('click', function(e) {
-    if (e.target === this) this.classList.remove('active');
-  });
-
-  function renderFiles(files) {
-    const list = document.getElementById('file-list');
-    const status = document.getElementById('status');
-    status.textContent = files.length + ' file(s) on storage';
-    if (files.length === 0) {
-      list.innerHTML = '<div id="empty">No files found on storage.</div>';
-      return;
-    }
-    list.innerHTML = '';
-    files.forEach(f => {
-      const div = document.createElement('div');
-      div.className = 'file-item';
-      const actions = canPreview(f.name)
-        ? `<button class="btn btn-preview" onclick="previewFile('${f.path.replace(/'/g,"\\'")}','${f.name.replace(/'/g,"\\'")}')">Preview</button>`
-        : '';
-      div.innerHTML = `
-        <div class="file-icon">${fileIcon(f.name)}</div>
-        <div class="file-info">
-          <div class="file-name" title="${f.path}">${f.name}</div>
-          <div class="file-meta">${f.path} &bull; ${fmtSize(f.size)}</div>
-        </div>
-        <div class="actions">
-          ${actions}
-          <a href="/download?path=${encodeURIComponent(f.path)}" download="${f.name}">
-            <button class="btn btn-download">Download</button>
-          </a>
-        </div>`;
-      list.appendChild(div);
-    });
-  }
-
-  function loadFiles() {
-    fetch('/api/files')
-      .then(r => r.json())
-      .then(renderFiles)
-      .catch(() => {
-        document.getElementById('status').textContent = 'Failed to load files';
-      });
-  }
-
-  loadFiles();
-  setInterval(loadFiles, 5000);
-</script>
-</body>
-</html>)rawhtml";
+  html += "</pre>\n";
+  html += "<p><a href=\"/snapshot\">/snapshot</a> — live camera image</p>\n";
+  html += "</body></html>\n";
 
   server.send(200, "text/html", html);
 }
 
-// Serves the file list as a JSON array.
-void handleFileListAPI() {
-  String json = generateFileListJSON();
-  server.send(200, "application/json", json);
-}
+// Captures a live frame from the camera and streams it to the browser as JPEG.
+// The camera DMA buffer is written directly to the TCP socket and released
+// immediately — no file is written and no extra heap copy is made.
+void handleSnapshot() {
+  Serial.println("[WebServer] Snapshot requested — capturing frame...");
 
-// Streams a requested file to the client in 4 KB chunks.
-// Validates the path to prevent directory traversal attacks.
-void handleFileDownload() {
-  if (!server.hasArg("path")) {
-    server.send(400, "text/plain", "Missing path parameter");
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("[WebServer] Snapshot: camera capture failed");
+    server.send(503, "text/plain", "Camera capture failed");
     return;
   }
 
-  String path = server.arg("path");
+  Serial.printf("[WebServer] Snapshot: captured %u bytes\n", (unsigned)fb->len);
 
-  // ---- Prevent Directory Traversal ----
-  if (path.indexOf("..") >= 0) {
-    server.send(403, "text/plain", "Forbidden");
-    return;
-  }
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma",        "no-cache");
+  server.setContentLength(fb->len);
+  server.send(200, "image/jpeg", "");
 
-  // ---- Ensure Leading Slash ----
-  if (!path.startsWith("/")) path = "/" + path;
-
-  // ---- Open File ----
-  File file;
-  if (currentStorage == STORAGE_SD_CARD) {
-    file = SD.open(path.c_str());
-  } else if (currentStorage == STORAGE_SPIFFS) {
-    file = SPIFFS.open(path.c_str(), "r");
-  }
-
-  if (!file || file.isDirectory()) {
-    server.send(404, "text/plain", "File not found");
-    return;
-  }
-
-  // ---- Send Headers ----
-  String mime = getMimeType(path);
-  server.sendHeader("Content-Disposition", "attachment; filename=\"" + path.substring(path.lastIndexOf('/') + 1) + "\"");
-  server.setContentLength(file.size());
-  server.send(200, mime, "");
-
-  // ---- Stream File in 4 KB Chunks ----
-  static uint8_t buf[4096];
   WiFiClient client = server.client();
-  while (file.available() && client.connected()) {
-    size_t n = file.read(buf, sizeof(buf));
-    client.write(buf, n);
-  }
-  file.close();
+  client.write(fb->buf, fb->len);
+
+  // MUST be called after every esp_camera_fb_get() to return the DMA slot
+  esp_camera_fb_return(fb);
+
+  Serial.println("[WebServer] Snapshot: response sent and frame buffer released");
 }
 
 // ============================================================================
@@ -1298,27 +1022,31 @@ void handleFileDownload() {
 // ============================================================================
 
 // Starts the WiFi access point and HTTP server, registering all routes.
+// Nothing in this function runs until the user types 'start'.
 void startWebServer() {
   if (webServerRunning) {
     Serial.println("Web server is already running.\n");
     return;
   }
 
-  // ---- Start Access Point ----
+  // Start the access point
+  Serial.println("[WebServer] Starting WiFi Access Point...");
   WiFi.softAP(AP_SSID, AP_PASSWORD);
   IPAddress ip = WiFi.softAPIP();
-  Serial.printf("WiFi AP started  SSID: %s  Password: %s\n", AP_SSID, AP_PASSWORD);
-  Serial.printf("Browse files at: http://%s/\n\n", ip.toString().c_str());
+  Serial.printf("[WebServer] AP started  SSID: %s  Password: %s  IP: %s\n",
+                AP_SSID, AP_PASSWORD, ip.toString().c_str());
 
-  // ---- Register Routes ----
-  server.on("/",          HTTP_GET, handleHomePage);
-  server.on("/api/files", HTTP_GET, handleFileListAPI);
-  server.on("/download",  HTTP_GET, handleFileDownload);
+  // Register the two routes — only reachable after start()
+  server.on("/",         HTTP_GET, handleHomePage);
+  server.on("/snapshot", HTTP_GET, handleSnapshot);
+  Serial.println("[WebServer] Routes registered: /  /snapshot");
 
-  // ---- Start HTTP Server ----
   server.begin();
   webServerRunning = true;
-  Serial.println("HTTP server started on port 80.\n");
+
+  Serial.println("[WebServer] HTTP server listening on port 80");
+  Serial.printf("[WebServer] File list:     http://%s/\n",         ip.toString().c_str());
+  Serial.printf("[WebServer] Live snapshot: http://%s/snapshot\n\n", ip.toString().c_str());
 }
 
 // Stops the HTTP server and shuts down the WiFi access point.
@@ -1453,6 +1181,13 @@ void loop() {
   if (termCommand.length() > 0) {
     processTerminalCommand(termCommand);
     Serial.print("> ");
+  }
+
+  // ---- Handle Incoming Web Requests ----
+  // Checked every loop iteration but only active after 'start' is typed.
+  // When the server is not running this branch costs a single boolean test.
+  if (webServerRunning) {
+    server.handleClient();
   }
 
   // ---- Check Trigger from Arduino ----
