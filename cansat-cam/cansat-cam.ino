@@ -110,17 +110,15 @@ class LogBuffer {
 public:
   void begin() { head = 0; used = 0; }
 
-  void print(const char* text, bool includeInWebLog = false) {
+  void print(const char* text) {
     if (!text) return;
     if (Serial) {
       Serial.print(text);
     }
-    if (includeInWebLog) {
-      append(text);
-    }
+    append(text);
   }
 
-  void printf(bool includeInWebLog, const char* fmt, ...) {
+  void printf(const char* fmt, ...) {
     if (!fmt) return;
     char line[192];
     va_list args;
@@ -128,8 +126,15 @@ public:
     int n = vsnprintf(line, sizeof(line), fmt, args);
     va_end(args);
     if (n > 0) {
-      print(line, includeInWebLog);
+      print(line);
     }
+  }
+
+  void println(const char* text) {
+    if (text && text[0] != '\0') {
+      print(text);
+    }
+    print("\n");
   }
 
   String snapshot() const {
@@ -1226,7 +1231,7 @@ void collectFilesSPIFFSFlat(std::vector<String>& files) {
 // Serves a plain, unformatted HTML page that lists every file on storage
 // and provides a link to the live snapshot page.
 void handleHomePage() {
-  logs.print("[WebServer] Home page requested — collecting file list...\n", true);
+  logs.print("[WebServer] Home page requested — collecting file list...\n");
 
   // Collect all file paths from whichever storage backend is active
   std::vector<String> files;
@@ -1236,7 +1241,7 @@ void handleHomePage() {
     collectFilesSPIFFSFlat(files);
   }
 
-  logs.printf(true, "[WebServer] Sending file list: %u file(s)\n", (unsigned)files.size());
+  logs.printf("[WebServer] Sending file list: %u file(s)\n", (unsigned)files.size());
 
   // Build a minimal HTML page — no CSS, no JavaScript, no formatting
   String html = "<!DOCTYPE html><html><body>\n";
@@ -1259,16 +1264,16 @@ void handleLogs() {
 // The camera DMA buffer is written directly to the TCP socket and released
 // immediately — no file is written and no extra heap copy is made.
 void handleSnapshot() {
-  logs.print("[WebServer] Snapshot requested — capturing frame...\n", true);
+  logs.print("[WebServer] Snapshot requested — capturing frame...\n");
 
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
-    logs.print("[WebServer] Snapshot: camera capture failed\n", true);
+    logs.print("[WebServer] Snapshot: camera capture failed\n");
     server.send(503, "text/plain", "Camera capture failed");
     return;
   }
 
-  logs.printf(true, "[WebServer] Snapshot: captured %u bytes\n", (unsigned)fb->len);
+  logs.printf("[WebServer] Snapshot: captured %u bytes\n", (unsigned)fb->len);
 
   // Send headers first, then body as a single sendContent chunk.
   // sendContent() appends body bytes to the already-open HTTP response
@@ -1283,7 +1288,7 @@ void handleSnapshot() {
   // MUST be called after every esp_camera_fb_get() to return the DMA slot
   esp_camera_fb_return(fb);
 
-  logs.print("[WebServer] Snapshot: response sent and frame buffer released\n", true);
+  logs.print("[WebServer] Snapshot: response sent and frame buffer released\n");
 }
 
 void handleFileFetch() {
@@ -1348,44 +1353,44 @@ void handleFileFetch() {
 // Nothing in this function runs until the user types 'start'.
 void startWebServer() {
   if (webServerRunning) {
-    Serial.println("Web server is already running.\n");
+    logs.println("Web server is already running.");
     return;
   }
 
   // Start the access point
-  Serial.println("[WebServer] Starting WiFi Access Point...");
+  logs.println("[WebServer] Starting WiFi Access Point...");
   WiFi.softAP(AP_SSID, AP_PASSWORD);
   IPAddress ip = WiFi.softAPIP();
-  Serial.printf("[WebServer] AP started  SSID: %s  Password: %s  IP: %s\n",
-                AP_SSID, AP_PASSWORD, ip.toString().c_str());
+  logs.printf("[WebServer] AP started  SSID: %s  Password: %s  IP: %s\n",
+              AP_SSID, AP_PASSWORD, ip.toString().c_str());
 
   // Register routes — only reachable after start()
   server.on("/",         HTTP_GET, handleHomePage);
   server.on("/snapshot", HTTP_GET, handleSnapshot);
   server.on("/logs",     HTTP_GET, handleLogs);
   server.onNotFound(handleFileFetch);
-  Serial.println("[WebServer] Routes registered: /  /snapshot  /logs");
+  logs.println("[WebServer] Routes registered: /  /snapshot  /logs");
 
   server.begin();
   webServerRunning = true;
 
-  Serial.println("[WebServer] HTTP server listening on port 80");
-  Serial.printf("[WebServer] File list:     http://%s/\n",         ip.toString().c_str());
-  Serial.printf("[WebServer] Live snapshot: http://%s/snapshot\n", ip.toString().c_str());
-  Serial.printf("[WebServer] Logs:          http://%s/logs\n\n", ip.toString().c_str());
+  logs.println("[WebServer] HTTP server listening on port 80");
+  logs.printf("[WebServer] File list:     http://%s/\n", ip.toString().c_str());
+  logs.printf("[WebServer] Live snapshot: http://%s/snapshot\n", ip.toString().c_str());
+  logs.printf("[WebServer] Logs:          http://%s/logs\n", ip.toString().c_str());
 }
 
 // Stops the HTTP server and shuts down the WiFi access point.
 void stopWebServer() {
   if (!webServerRunning) {
-    Serial.println("Web server is not running.\n");
+    logs.println("Web server is not running.");
     return;
   }
 
   server.stop();
   WiFi.softAPdisconnect(true);
   webServerRunning = false;
-  Serial.println("Web server stopped.\n");
+  logs.println("Web server stopped.");
 }
 
 // ============================================================================
