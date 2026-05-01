@@ -1089,12 +1089,10 @@ void handleHomePage() {
   // Build a minimal HTML page — no CSS, no JavaScript, no formatting
   String html = "<!DOCTYPE html><html><body>\n";
   html += "<p>Files on storage (" + String(files.size()) + "):</p>\n";
-  html += "<pre>\n";
   for (const String& path : files) {
     html += "<a href=\"" + path + "\">" + path + "</a><br>\n";
   }
-  html += "</pre>\n";
-  html += "<p><a href=\"/snapshot\">/snapshot</a> — live camera image</p>\n";
+  html += "<p><a href=\"/snapshot\">/snapshot</a> - live camera image</p>\n";
   html += "</body></html>\n";
 
   server.send(200, "text/html", html);
