@@ -1258,6 +1258,7 @@ void handleFileFetch() {
   if (q >= 0) {
     path = path.substring(0, q);
   }
+  // Keep incoming PR behavior: decode URL-encoded paths before serving.
   path = decodeUrlComponent(path);
   if (!path.startsWith("/")) {
     path = "/" + path;
