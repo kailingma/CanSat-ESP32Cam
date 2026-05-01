@@ -1091,7 +1091,7 @@ void handleHomePage() {
   html += "<p>Files on storage (" + String(files.size()) + "):</p>\n";
   html += "<pre>\n";
   for (const String& path : files) {
-    html += path + "\n";
+    html += "<a href=\"" + path + "\">" + path + "</a><br>\n";
   }
   html += "</pre>\n";
   html += "<p><a href=\"/snapshot\">/snapshot</a> — live camera image</p>\n";
