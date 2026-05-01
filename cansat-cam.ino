@@ -6,6 +6,7 @@
 #include <FS.h>
 #include <vector>
 #include <algorithm>
+#include <functional>
 
 // ============================================================================
 // CAMERA PIN DEFINITIONS
@@ -123,6 +124,21 @@ bool isHiddenPath(const String& fullPath) {
     segmentStart = nextSlash + 1;
   }
   return false;
+}
+
+bool isHiddenName(const char* name) {
+  return name != nullptr && name[0] == '.';
+}
+
+String getContentType(const String& path) {
+  if (path.endsWith(".jpg") || path.endsWith(".jpeg")) return "image/jpeg";
+  if (path.endsWith(".png")) return "image/png";
+  if (path.endsWith(".gif")) return "image/gif";
+  if (path.endsWith(".bmp")) return "image/bmp";
+  if (path.endsWith(".txt")) return "text/plain";
+  if (path.endsWith(".html")) return "text/html";
+  if (path.endsWith(".json")) return "application/json";
+  return "application/octet-stream";
 }
 
 // ============================================================================
@@ -793,7 +809,7 @@ void listFilesSDCard(const char* path, int indent) {
   // ---- Iterate Through All Files and Directories ----
   while (file) {
     String entryName = String(file.name());
-    if (entryName.startsWith(".")) {
+    if (isHiddenName(file.name())) {
       file.close();
       file = dir.openNextFile();
       continue;
@@ -973,22 +989,43 @@ void formatStorage() {
         Serial.println("Formatting...");
         
         if (currentStorage == STORAGE_SD_CARD) {
-          // ---- Format SD Card ----
-          // Note: SD library doesn't have a direct format function
-          // We'll erase all files instead
-          File root = SD_MMC.open("/");
-          if (root) {
-            File file = root.openNextFile();
-            while (file) {
-              if (!file.isDirectory()) {
-                SD_MMC.remove(file.name());
-              }
-              file.close();
-              file = root.openNextFile();
+          std::vector<String> directories;
+          std::vector<String> files;
+
+          std::function<void(const char*)> scan = [&](const char* dirPath) {
+            File dir = SD_MMC.open(dirPath);
+            if (!dir || !dir.isDirectory()) {
+              return;
             }
-            root.close();
+
+            File entry = dir.openNextFile();
+            while (entry) {
+              String fullPath = (strcmp(dirPath, "/") == 0)
+                                  ? String("/") + entry.name()
+                                  : String(dirPath) + "/" + entry.name();
+
+              if (entry.isDirectory()) {
+                directories.push_back(fullPath);
+                entry.close();
+                scan(fullPath.c_str());
+              } else {
+                files.push_back(fullPath);
+                entry.close();
+              }
+              entry = dir.openNextFile();
+            }
+            dir.close();
+          };
+
+          scan("/");
+
+          for (const String& p : files) {
+            SD_MMC.remove(p);
           }
-          Serial.println("SD card contents cleared\n");
+          for (int i = directories.size() - 1; i >= 0; --i) {
+            SD_MMC.rmdir(directories[i]);
+          }
+          Serial.println("SD card contents erased recursively\n");
         } else if (currentStorage == STORAGE_SPIFFS) {
           // ---- Format SPIFFS ----
           SPIFFS.format();
@@ -1177,6 +1214,14 @@ void handleSnapshot() {
 
 void handleFileFetch() {
   String path = server.uri();
+  int q = path.indexOf('?');
+  if (q >= 0) {
+    path = path.substring(0, q);
+  }
+  path = urlDecode(path);
+  if (!path.startsWith("/")) {
+    path = "/" + path;
+  }
   if (path.length() == 0) {
     server.send(400, "text/plain", "Invalid path");
     return;
@@ -1216,7 +1261,8 @@ void handleFileFetch() {
     return;
   }
 
-  server.streamFile(file, "application/octet-stream");
+  String contentType = getContentType(path);
+  server.streamFile(file, contentType);
   file.close();
 }
 
