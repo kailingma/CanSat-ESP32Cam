@@ -2,10 +2,11 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <SPIFFS.h>
-#include <SD.h>
+#include <SD_MMC.h>
 #include <FS.h>
 #include <vector>
 #include <algorithm>
+#include <functional>
 
 // ============================================================================
 // CAMERA PIN DEFINITIONS
@@ -39,16 +40,21 @@
 // ============================================================================
 // These pins connect to the remote Arduino controller.
 
-#define TRIGGER_PIN       13    // Input pin: Arduino pulls LOW to request photo capture
-#define UART_RX           14    // Serial2 RX: receives filename from Arduino
-#define UART_TX           15    // Serial2 TX: sends status messages back to Arduino
+// IMPORTANT:
+// - SD card is initialized in 1-bit SD_MMC mode to free GPIO12 and GPIO13.
+// - UART is moved to GPIO13/GPIO12 (RX/TX) to keep GPIO1/GPIO3 free for USB serial monitor.
+// - GPIO4 is used for trigger input (it also drives the flash LED on many boards).
+#define TRIGGER_PIN        4    // Input pin: Arduino pulls LOW to request photo capture
+#define UART_RX           13    // Serial2 RX: receives filename from Arduino
+#define UART_TX           12    // Serial2 TX: sends status messages back to Arduino
 
 // ============================================================================
 // SD CARD PIN DEFINITIONS
 // ============================================================================
-// These pins connect to the SD card module via SPI.
-
-#define SD_CS             5     // Chip select pin for SD card SPI
+// On the AI-Thinker ESP32-CAM the onboard microSD is wired as SD_MMC:
+//   CLK=GPIO14, CMD=GPIO15, DATA0=GPIO2, DATA1=GPIO4, DATA2=GPIO12, DATA3=GPIO13
+// We run SD_MMC in 1-bit mode so DATA2 (GPIO12) and DATA3 (GPIO13) are unused
+// by SD and can be repurposed for external UART.
 
 // ============================================================================
 // STORAGE MODE ENUMERATION
@@ -67,12 +73,16 @@ enum StorageMode {
 
 // Flag set by interrupt when trigger pin goes LOW
 volatile bool captureFlag = false;
+unsigned long ignoreTriggerUntilMs = 0;
 
 // Tracks which storage device is currently in use
 StorageMode currentStorage = STORAGE_NONE;
 
 // Counter for failed captures (no filename, timeout, or invalid format)
 uint16_t failCounter = 0;
+
+// Next auto-increment number for SPIFFS camera roll (/NNNN.jpg)
+uint16_t spiffsImageCounter = 1;
 
 // ============================================================================
 // WEB SERVER GLOBAL STATE
@@ -89,6 +99,80 @@ bool webServerRunning = false;
 // The default "12345678" is intentionally simple for first-time setup only.
 static const char* AP_SSID     = "ESP32-CAM-Browser";
 static const char* AP_PASSWORD = "12345678";
+
+// ============================================================================
+// PATH VISIBILITY HELPERS
+// ============================================================================
+// Hidden entries are any files or directories whose name starts with '.'
+// (e.g. ".secret", "/logs/.tmp/cap.jpg"). These are excluded from terminal
+// listings and from all web server file listing/fetch routes.
+
+bool isHiddenPath(const String& fullPath) {
+  int segmentStart = 0;
+  while (segmentStart < fullPath.length()) {
+    int nextSlash = fullPath.indexOf('/', segmentStart);
+    if (nextSlash == -1) {
+      nextSlash = fullPath.length();
+    }
+
+    if (nextSlash > segmentStart) {
+      String segment = fullPath.substring(segmentStart, nextSlash);
+      if (segment.length() > 0 && segment[0] == '.') {
+        return true;
+      }
+    }
+
+    segmentStart = nextSlash + 1;
+  }
+  return false;
+}
+
+bool isHiddenName(const char* name) {
+  return name != nullptr && name[0] == '.';
+}
+
+String getContentType(const String& path) {
+  if (path.endsWith(".jpg") || path.endsWith(".jpeg")) return "image/jpeg";
+  if (path.endsWith(".png")) return "image/png";
+  if (path.endsWith(".gif")) return "image/gif";
+  if (path.endsWith(".bmp")) return "image/bmp";
+  if (path.endsWith(".txt")) return "text/plain";
+  if (path.endsWith(".html")) return "text/html";
+  if (path.endsWith(".json")) return "application/json";
+  return "application/octet-stream";
+}
+
+String decodeUrlComponent(const String& input) {
+  // Minimal percent-decoder for request paths.
+  // We avoid framework-specific helpers here so the sketch compiles across
+  // Arduino-ESP32 core versions where urlDecode() may not exist.
+  String output;
+  output.reserve(input.length());
+
+  for (int i = 0; i < input.length(); i++) {
+    char c = input[i];
+
+    if (c == '+') {
+      output += ' ';
+      continue;
+    }
+
+    if (c == '%' && i + 2 < input.length()) {
+      char hi = input[i + 1];
+      char lo = input[i + 2];
+      if (isxdigit(hi) && isxdigit(lo)) {
+        char hex[3] = { hi, lo, '\0' };
+        output += (char)strtol(hex, nullptr, 16);
+        i += 2;
+        continue;
+      }
+    }
+
+    output += c;
+  }
+
+  return output;
+}
 
 // ============================================================================
 // INTERRUPT SERVICE ROUTINE (ISR)
@@ -115,14 +199,14 @@ void IRAM_ATTR triggerISR() {
 
 bool initSDCard() {
   // ---- Attempt SD Card Initialization ----
-  // SD.begin() initializes SPI communication with the SD card
-  if (!SD.begin(SD_CS)) {
+  // 1-bit mode frees GPIO12/GPIO13 from SD data lines.
+  if (!SD_MMC.begin("/sdcard", true /* mode1bit */)) {
     Serial.println("SD card initialization failed");
     return false;
   }
 
   // ---- Verify SD Card is Readable ----
-  uint8_t cardType = SD.cardType();
+  uint8_t cardType = SD_MMC.cardType();
 
   if (cardType == CARD_NONE) {
     Serial.println("No SD card detected");
@@ -141,7 +225,7 @@ bool initSDCard() {
   }
 
   // ---- Print Storage Statistics ----
-  uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+  uint64_t cardSize = SD_MMC.cardSize() / (1024 * 1024);
   Serial.printf("SD card size: %lluMB\n", cardSize);
 
   currentStorage = STORAGE_SD_CARD;
@@ -190,7 +274,7 @@ void initializeFailCounter() {
   // ---- Scan Existing Failed Captures ----
   if (currentStorage == STORAGE_SD_CARD) {
     // ---- SD Card /fail/ Directory ----
-    File failDir = SD.open("/fail");
+    File failDir = SD_MMC.open("/fail");
     if (failDir && failDir.isDirectory()) {
       Serial.println("Scanning SD card /fail/ directory...");
       
@@ -274,6 +358,57 @@ void initializeFailCounter() {
 }
 
 // ============================================================================
+// SPIFFS IMAGE COUNTER INITIALIZATION
+// ============================================================================
+// Scans SPIFFS for files matching /NNNN.jpg (at root) and initializes
+// spiffsImageCounter to the next available number.
+
+uint16_t getNextSPIFFSImageNumber() {
+  if (currentStorage != STORAGE_SPIFFS) {
+    return 1;
+  }
+
+  uint16_t maxFound = 0;
+  File root = SPIFFS.open("/");
+  if (!root) {
+    return 1;
+  }
+
+  File file = root.openNextFile();
+  while (file) {
+    if (!file.isDirectory()) {
+      String filename = file.name();
+      // Root files look like "/0001.jpg".
+      if (filename.length() == 9 && filename[0] == '/' && filename.endsWith(".jpg")) {
+        String numberPart = filename.substring(1, 5);
+        bool isValidNumber = true;
+        for (int i = 0; i < 4; i++) {
+          if (!isdigit(numberPart[i])) {
+            isValidNumber = false;
+            break;
+          }
+        }
+        if (isValidNumber) {
+          uint16_t fileNumber = numberPart.toInt();
+          if (fileNumber > maxFound) {
+            maxFound = fileNumber;
+          }
+        }
+      }
+    }
+    file.close();
+    file = root.openNextFile();
+  }
+  root.close();
+
+  uint16_t next = maxFound + 1;
+  if (next > 9999) {
+    next = 1;
+  }
+  return next;
+}
+
+// ============================================================================
 // FILEPATH VALIDATION FUNCTION
 // ============================================================================
 // Validates that a received filepath matches expected format.
@@ -332,7 +467,7 @@ bool isValidFilepath(const String& filepath) {
 bool ensureDirectoryExists(const char* path) {
   if (currentStorage == STORAGE_SD_CARD) {
     // ---- SD Card Directory Handling ----
-    File dir = SD.open(path);
+    File dir = SD_MMC.open(path);
     
     if (dir && dir.isDirectory()) {
       dir.close();
@@ -344,7 +479,7 @@ bool ensureDirectoryExists(const char* path) {
     }
 
     // ---- Create Directory on SD Card ----
-    if (SD.mkdir(path)) {
+    if (SD_MMC.mkdir(path)) {
       Serial.printf("Created directory: %s\n", path);
       return true;
     } else {
@@ -375,15 +510,24 @@ bool captureAndSave(const char* filepath) {
     return false;
   }
 
-  // ---- Validate Filepath Format ----
+  // ---- SPIFFS naming behavior ----
+  // SPIFFS is treated as a flat "camera roll": any requested filename is
+  // ignored and we always auto-increment to the next available NNNN.jpg.
+  if (currentStorage == STORAGE_SPIFFS) {
+    bool success = captureAndSaveAutoIncrementSPIFFS(fb);
+    esp_camera_fb_return(fb);
+    return success;
+  }
+
+  // ---- Validate Filepath Format (SD card only) ----
   if (!isValidFilepath(filepath)) {
     Serial.printf("Invalid filepath format: %s\n", filepath);
     Serial.println("Saving to failure fallback location");
-    
+
     // ---- Save to Failure Fallback ----
     bool success = captureAndSaveFailure(fb);
     esp_camera_fb_return(fb);
-    
+
     return success;
   }
 
@@ -407,7 +551,7 @@ bool captureAndSave(const char* filepath) {
   bool success = false;
   
   if (currentStorage == STORAGE_SD_CARD) {
-    File file = SD.open(filepath, FILE_WRITE);
+    File file = SD_MMC.open(filepath, FILE_WRITE);
     if (file) {
       size_t written = file.write(fb->buf, fb->len);
       file.close();
@@ -439,6 +583,44 @@ bool captureAndSave(const char* filepath) {
 }
 
 // ============================================================================
+// SPIFFS AUTO-INCREMENT SAVE
+// ============================================================================
+// When SPIFFS is the active backend, ignore the requested filename and instead
+// save as /NNNN.jpg where NNNN is one higher than the highest existing number.
+
+bool captureAndSaveAutoIncrementSPIFFS(camera_fb_t *fb) {
+  // Use cached counter (initialized at boot, updated after each save).
+  // This avoids re-scanning SPIFFS on every capture.
+  uint16_t nextNumber = spiffsImageCounter;
+  char path[16];
+  snprintf(path, sizeof(path), "/%04d.jpg", nextNumber);
+
+  Serial.printf("SPIFFS auto-increment save: %s\n", path);
+
+  File file = SPIFFS.open(path, FILE_WRITE);
+  if (!file) {
+    Serial.printf("SPIFFS open failed: %s\n", path);
+    return false;
+  }
+
+  size_t written = file.write(fb->buf, fb->len);
+  file.close();
+
+  if (written != fb->len) {
+    Serial.printf("SPIFFS write incomplete. Wrote %d of %d bytes\n", written, fb->len);
+    return false;
+  }
+
+  Serial.printf("Saved to SPIFFS: %s (%d bytes)\n", path, written);
+
+  spiffsImageCounter++;
+  if (spiffsImageCounter > 9999) {
+    spiffsImageCounter = 1;
+  }
+  return true;
+}
+
+// ============================================================================
 // FAILED CAPTURE FALLBACK SAVE
 // ============================================================================
 // Handles captures that failed due to timeout, no filename, or invalid format.
@@ -460,7 +642,7 @@ bool captureAndSaveFailure(camera_fb_t *fb) {
   bool success = false;
   
   if (currentStorage == STORAGE_SD_CARD) {
-    File file = SD.open(failPath, FILE_WRITE);
+    File file = SD_MMC.open(failPath, FILE_WRITE);
     if (file) {
       size_t written = file.write(fb->buf, fb->len);
       file.close();
@@ -641,7 +823,7 @@ void listFilesSDCard(const char* path, int indent) {
   }
 
   // ---- Attempt to Open Directory ----
-  File dir = SD.open(path);
+  File dir = SD_MMC.open(path);
   if (!dir || !dir.isDirectory()) {
     Serial.printf("%sDirectory not found: %s\n", indentStr.c_str(), path);
     return;
@@ -659,18 +841,25 @@ void listFilesSDCard(const char* path, int indent) {
 
   // ---- Iterate Through All Files and Directories ----
   while (file) {
+    String entryName = String(file.name());
+    if (isHiddenName(file.name())) {
+      file.close();
+      file = dir.openNextFile();
+      continue;
+    }
+
     if (file.isDirectory()) {
       // ---- Display Directory Entry ----
-      Serial.printf("%s[DIR] %s/\n", indentStr.c_str(), file.name());
+      Serial.printf("%s[DIR] %s/\n", indentStr.c_str(), entryName.c_str());
       
       // ---- Build Full Path for Recursion ----
       char fullPath[128];
       if (strcmp(path, "/") == 0) {
         // If current path is root, just append filename
-        snprintf(fullPath, sizeof(fullPath), "/%s", file.name());
+        snprintf(fullPath, sizeof(fullPath), "/%s", entryName.c_str());
       } else {
         // Otherwise append to current path
-        snprintf(fullPath, sizeof(fullPath), "%s/%s", path, file.name());
+        snprintf(fullPath, sizeof(fullPath), "%s/%s", path, entryName.c_str());
       }
 
       // ---- Recursively List Subdirectory ----
@@ -678,7 +867,7 @@ void listFilesSDCard(const char* path, int indent) {
 
     } else {
       // ---- Display File Entry ----
-      Serial.printf("%s%s (%d bytes)\n", indentStr.c_str(), file.name(), file.size());
+      Serial.printf("%s%s (%d bytes)\n", indentStr.c_str(), entryName.c_str(), file.size());
     }
 
     // ---- Move to Next File ----
@@ -722,6 +911,11 @@ void listFilesSPIFFS() {
   File file = root.openNextFile();
   while (file && fileCount < 100) {
     String fullPath = file.name();
+    if (isHiddenPath(fullPath)) {
+      file.close();
+      file = root.openNextFile();
+      continue;
+    }
     
     // ---- Store File Info ----
     strncpy(files[fileCount].path, fullPath.c_str(), sizeof(files[fileCount].path) - 1);
@@ -789,7 +983,7 @@ void deleteFile(const char* filepath) {
 
   bool success = false;
   if (currentStorage == STORAGE_SD_CARD) {
-    success = SD.remove(filepath);
+    success = SD_MMC.remove(filepath);
   } else if (currentStorage == STORAGE_SPIFFS) {
     success = SPIFFS.remove(filepath);
   }
@@ -828,22 +1022,43 @@ void formatStorage() {
         Serial.println("Formatting...");
         
         if (currentStorage == STORAGE_SD_CARD) {
-          // ---- Format SD Card ----
-          // Note: SD library doesn't have a direct format function
-          // We'll erase all files instead
-          File root = SD.open("/");
-          if (root) {
-            File file = root.openNextFile();
-            while (file) {
-              if (!file.isDirectory()) {
-                SD.remove(file.name());
-              }
-              file.close();
-              file = root.openNextFile();
+          std::vector<String> directories;
+          std::vector<String> files;
+
+          std::function<void(const char*)> scan = [&](const char* dirPath) {
+            File dir = SD_MMC.open(dirPath);
+            if (!dir || !dir.isDirectory()) {
+              return;
             }
-            root.close();
+
+            File entry = dir.openNextFile();
+            while (entry) {
+              String fullPath = (strcmp(dirPath, "/") == 0)
+                                  ? String("/") + entry.name()
+                                  : String(dirPath) + "/" + entry.name();
+
+              if (entry.isDirectory()) {
+                directories.push_back(fullPath);
+                entry.close();
+                scan(fullPath.c_str());
+              } else {
+                files.push_back(fullPath);
+                entry.close();
+              }
+              entry = dir.openNextFile();
+            }
+            dir.close();
+          };
+
+          scan("/");
+
+          for (const String& p : files) {
+            SD_MMC.remove(p);
           }
-          Serial.println("SD card contents cleared\n");
+          for (int i = directories.size() - 1; i >= 0; --i) {
+            SD_MMC.rmdir(directories[i]);
+          }
+          Serial.println("SD card contents erased recursively\n");
         } else if (currentStorage == STORAGE_SPIFFS) {
           // ---- Format SPIFFS ----
           SPIFFS.format();
@@ -872,6 +1087,11 @@ void formatStorage() {
 
 void simulateCapture() {
   Serial.println("Simulating trigger (no filename)...");
+
+  // Ignore any GPIO4 transition side-effects caused by camera/flash activity
+  // during this local simulation path.
+  ignoreTriggerUntilMs = millis() + 1000;
+  captureFlag = false;
   
   // ---- Capture Image ----
   camera_fb_t *fb = esp_camera_fb_get();
@@ -900,7 +1120,7 @@ void simulateCapture() {
 void collectFilesRecursive(const char* dirPath, std::vector<String>& files) {
   Serial.printf("[WebServer] Scanning SD directory: %s\n", dirPath);
 
-  File dir = SD.open(dirPath);
+  File dir = SD_MMC.open(dirPath);
   if (!dir || !dir.isDirectory()) {
     Serial.printf("[WebServer] Cannot open directory: %s\n", dirPath);
     return;
@@ -916,12 +1136,18 @@ void collectFilesRecursive(const char* dirPath, std::vector<String>& files) {
       fullPath = String(dirPath) + "/" + entry.name();
     }
 
+    if (isHiddenPath(fullPath)) {
+      entry.close();
+      entry = dir.openNextFile();
+      continue;
+    }
+
     if (entry.isDirectory()) {
       Serial.printf("[WebServer]   Entering directory: %s\n", fullPath.c_str());
       // Close the directory entry BEFORE recursing: the ESP32 SD library has a
       // limited number of open file handles. Releasing this handle first prevents
       // exhaustion in deep directory trees — the recursive call opens the
-      // subdirectory independently via SD.open(fullPath).
+      // subdirectory independently via SD_MMC.open(fullPath).
       entry.close();
       collectFilesRecursive(fullPath.c_str(), files);
     } else {
@@ -949,9 +1175,10 @@ void collectFilesSPIFFSFlat(std::vector<String>& files) {
 
   File entry = root.openNextFile();
   while (entry) {
-    if (!entry.isDirectory()) {
-      Serial.printf("[WebServer]   Found file: %s\n", entry.name());
-      files.push_back(String(entry.name()));
+    String fullPath = String(entry.name());
+    if (!entry.isDirectory() && !isHiddenPath(fullPath)) {
+      Serial.printf("[WebServer]   Found file: %s\n", fullPath.c_str());
+      files.push_back(fullPath);
     }
     // Close before advancing — required to free the file handle
     entry.close();
@@ -983,12 +1210,10 @@ void handleHomePage() {
   // Build a minimal HTML page — no CSS, no JavaScript, no formatting
   String html = "<!DOCTYPE html><html><body>\n";
   html += "<p>Files on storage (" + String(files.size()) + "):</p>\n";
-  html += "<pre>\n";
   for (const String& path : files) {
-    html += path + "\n";
+    html += "<a href=\"" + path + "\">" + path + "</a><br>\n";
   }
-  html += "</pre>\n";
-  html += "<p><a href=\"/snapshot\">/snapshot</a> — live camera image</p>\n";
+  html += "<p><a href=\"/snapshot\">/snapshot</a> - live camera image</p>\n";
   html += "</body></html>\n";
 
   server.send(200, "text/html", html);
@@ -1025,6 +1250,63 @@ void handleSnapshot() {
   Serial.println("[WebServer] Snapshot: response sent and frame buffer released");
 }
 
+void handleFileFetch() {
+  String path = server.uri();
+  // Normalize request path:
+  // 1) strip querystring, 2) decode %XX escapes, 3) force leading slash.
+  int q = path.indexOf('?');
+  if (q >= 0) {
+    path = path.substring(0, q);
+  }
+  // Keep incoming PR behavior: decode URL-encoded paths before serving.
+  path = decodeUrlComponent(path);
+  if (!path.startsWith("/")) {
+    path = "/" + path;
+  }
+  if (path.length() == 0) {
+    server.send(400, "text/plain", "Invalid path");
+    return;
+  }
+
+  if (isHiddenPath(path)) {
+    server.send(404, "text/plain", "Not found");
+    return;
+  }
+
+  if (path == "/" || path == "/snapshot") {
+    server.send(404, "text/plain", "Not found");
+    return;
+  }
+
+  fs::FS* fs = nullptr;
+  if (currentStorage == STORAGE_SD_CARD) {
+    fs = &SD_MMC;
+  } else if (currentStorage == STORAGE_SPIFFS) {
+    fs = &SPIFFS;
+  } else {
+    server.send(503, "text/plain", "No storage available");
+    return;
+  }
+
+  if (!fs->exists(path)) {
+    server.send(404, "text/plain", "File not found");
+    return;
+  }
+
+  File file = fs->open(path, FILE_READ);
+  if (!file || file.isDirectory()) {
+    server.send(404, "text/plain", "File not found");
+    if (file) {
+      file.close();
+    }
+    return;
+  }
+
+  String contentType = getContentType(path);
+  server.streamFile(file, contentType);
+  file.close();
+}
+
 // ============================================================================
 // WEB SERVER - SERVER MANAGEMENT
 // ============================================================================
@@ -1047,6 +1329,7 @@ void startWebServer() {
   // Register the two routes — only reachable after start()
   server.on("/",         HTTP_GET, handleHomePage);
   server.on("/snapshot", HTTP_GET, handleSnapshot);
+  server.onNotFound(handleFileFetch);
   Serial.println("[WebServer] Routes registered: /  /snapshot");
 
   server.begin();
@@ -1145,9 +1428,10 @@ void setup() {
   Serial.printf("  TX pin: GPIO %d\n", UART_TX);
 
   // ---- Setup Trigger Input Pin ----
-  pinMode(TRIGGER_PIN, INPUT);
+  // Keep trigger stable/high when the remote controller is disconnected.
+  pinMode(TRIGGER_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(TRIGGER_PIN), triggerISR, FALLING);
-  Serial.println("Trigger pin ready (GPIO 13, active LOW)\n");
+  Serial.printf("Trigger pin ready (GPIO %d, active LOW)\n\n", TRIGGER_PIN);
 
   // ---- Initialize Storage Systems ----
   Serial.println("--- Storage Initialization ---");
@@ -1157,6 +1441,12 @@ void setup() {
     if (!initSPIFFS()) {
       Serial.println("ERROR: No storage available!");
     }
+  }
+
+  // ---- Initialize SPIFFS Auto-Increment Counter ----
+  if (currentStorage == STORAGE_SPIFFS) {
+    spiffsImageCounter = getNextSPIFFSImageNumber();
+    Serial.printf("SPIFFS image counter initialized to: %04d\n", spiffsImageCounter);
   }
 
   // ---- Initialize Fail Counter ----
@@ -1171,7 +1461,7 @@ void setup() {
   Serial.println("\n--- System Ready ---");
   Serial.println("Waiting for trigger from Arduino...");
   Serial.println("Arduino should:");
-  Serial.println("  1. Pull GPIO 13 to LOW");
+  Serial.printf("  1. Pull GPIO %d to LOW\n", TRIGGER_PIN);
   Serial.println("  2. Send filepath over UART (e.g., \"/run01/12345.jpg\")\n");
   Serial.println("Type 'help' for terminal commands\n");
   Serial.print("> ");
@@ -1200,6 +1490,11 @@ void loop() {
 
   // ---- Check Trigger from Arduino ----
   if (captureFlag) {
+    if (millis() < ignoreTriggerUntilMs) {
+      captureFlag = false;
+      return;
+    }
+
     // ---- Clear Trigger Flag ----
     captureFlag = false;
 
