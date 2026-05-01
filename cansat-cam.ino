@@ -73,6 +73,7 @@ enum StorageMode {
 
 // Flag set by interrupt when trigger pin goes LOW
 volatile bool captureFlag = false;
+unsigned long ignoreTriggerUntilMs = 0;
 
 // Tracks which storage device is currently in use
 StorageMode currentStorage = STORAGE_NONE;
@@ -1054,6 +1055,11 @@ void formatStorage() {
 
 void simulateCapture() {
   Serial.println("Simulating trigger (no filename)...");
+
+  // Ignore any GPIO4 transition side-effects caused by camera/flash activity
+  // during this local simulation path.
+  ignoreTriggerUntilMs = millis() + 1000;
+  captureFlag = false;
   
   // ---- Capture Image ----
   camera_fb_t *fb = esp_camera_fb_get();
@@ -1449,6 +1455,11 @@ void loop() {
 
   // ---- Check Trigger from Arduino ----
   if (captureFlag) {
+    if (millis() < ignoreTriggerUntilMs) {
+      captureFlag = false;
+      return;
+    }
+
     // ---- Clear Trigger Flag ----
     captureFlag = false;
 
