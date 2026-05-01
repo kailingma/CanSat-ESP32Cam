@@ -2,7 +2,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <SPIFFS.h>
-#include <SD.h>
+#include <SD_MMC.h>
 #include <FS.h>
 #include <vector>
 #include <algorithm>
@@ -39,22 +39,21 @@
 // ============================================================================
 // These pins connect to the remote Arduino controller.
 
-#define TRIGGER_PIN       12    // Input pin: Arduino pulls LOW to request photo capture
-#define UART_RX           14    // Serial2 RX: receives filename from Arduino
-#define UART_TX           15    // Serial2 TX: sends status messages back to Arduino
+// IMPORTANT:
+// - SD card is initialized in 1-bit SD_MMC mode to free GPIO12 and GPIO13.
+// - UART is moved to GPIO13/GPIO12 (RX/TX) to keep GPIO1/GPIO3 free for USB serial monitor.
+// - GPIO4 is used for trigger input (it also drives the flash LED on many boards).
+#define TRIGGER_PIN        4    // Input pin: Arduino pulls LOW to request photo capture
+#define UART_RX           13    // Serial2 RX: receives filename from Arduino
+#define UART_TX           12    // Serial2 TX: sends status messages back to Arduino
 
 // ============================================================================
 // SD CARD PIN DEFINITIONS
 // ============================================================================
-// On the AI-Thinker ESP32-CAM the onboard microSD uses fixed SPI pins:
-//   SCK=GPIO14, MISO=GPIO2, MOSI=GPIO15, CS=GPIO13
-// IMPORTANT: GPIO5 is used by the camera data bus (Y2) on this board, so it
-// must NOT be used as SD CS.
-
-#define SD_CS             13    // Chip select pin for SD card SPI (AI-Thinker)
-
-// Dedicated SPI bus instance for the SD card (keeps SD off the default VSPI).
-static SPIClass sdSPI(HSPI);
+// On the AI-Thinker ESP32-CAM the onboard microSD is wired as SD_MMC:
+//   CLK=GPIO14, CMD=GPIO15, DATA0=GPIO2, DATA1=GPIO4, DATA2=GPIO12, DATA3=GPIO13
+// We run SD_MMC in 1-bit mode so DATA2 (GPIO12) and DATA3 (GPIO13) are unused
+// by SD and can be repurposed for external UART.
 
 // ============================================================================
 // STORAGE MODE ENUMERATION
@@ -124,15 +123,14 @@ void IRAM_ATTR triggerISR() {
 
 bool initSDCard() {
   // ---- Attempt SD Card Initialization ----
-  // SD.begin() initializes SPI communication with the SD card
-  sdSPI.begin(14 /* SCK */, 2 /* MISO */, 15 /* MOSI */, SD_CS /* CS */);
-  if (!SD.begin(SD_CS, sdSPI)) {
+  // 1-bit mode frees GPIO12/GPIO13 from SD data lines.
+  if (!SD_MMC.begin("/sdcard", true /* mode1bit */)) {
     Serial.println("SD card initialization failed");
     return false;
   }
 
   // ---- Verify SD Card is Readable ----
-  uint8_t cardType = SD.cardType();
+  uint8_t cardType = SD_MMC.cardType();
 
   if (cardType == CARD_NONE) {
     Serial.println("No SD card detected");
@@ -151,7 +149,7 @@ bool initSDCard() {
   }
 
   // ---- Print Storage Statistics ----
-  uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+  uint64_t cardSize = SD_MMC.cardSize() / (1024 * 1024);
   Serial.printf("SD card size: %lluMB\n", cardSize);
 
   currentStorage = STORAGE_SD_CARD;
@@ -200,7 +198,7 @@ void initializeFailCounter() {
   // ---- Scan Existing Failed Captures ----
   if (currentStorage == STORAGE_SD_CARD) {
     // ---- SD Card /fail/ Directory ----
-    File failDir = SD.open("/fail");
+    File failDir = SD_MMC.open("/fail");
     if (failDir && failDir.isDirectory()) {
       Serial.println("Scanning SD card /fail/ directory...");
       
@@ -393,7 +391,7 @@ bool isValidFilepath(const String& filepath) {
 bool ensureDirectoryExists(const char* path) {
   if (currentStorage == STORAGE_SD_CARD) {
     // ---- SD Card Directory Handling ----
-    File dir = SD.open(path);
+    File dir = SD_MMC.open(path);
     
     if (dir && dir.isDirectory()) {
       dir.close();
@@ -405,7 +403,7 @@ bool ensureDirectoryExists(const char* path) {
     }
 
     // ---- Create Directory on SD Card ----
-    if (SD.mkdir(path)) {
+    if (SD_MMC.mkdir(path)) {
       Serial.printf("Created directory: %s\n", path);
       return true;
     } else {
@@ -477,7 +475,7 @@ bool captureAndSave(const char* filepath) {
   bool success = false;
   
   if (currentStorage == STORAGE_SD_CARD) {
-    File file = SD.open(filepath, FILE_WRITE);
+    File file = SD_MMC.open(filepath, FILE_WRITE);
     if (file) {
       size_t written = file.write(fb->buf, fb->len);
       file.close();
@@ -568,7 +566,7 @@ bool captureAndSaveFailure(camera_fb_t *fb) {
   bool success = false;
   
   if (currentStorage == STORAGE_SD_CARD) {
-    File file = SD.open(failPath, FILE_WRITE);
+    File file = SD_MMC.open(failPath, FILE_WRITE);
     if (file) {
       size_t written = file.write(fb->buf, fb->len);
       file.close();
@@ -749,7 +747,7 @@ void listFilesSDCard(const char* path, int indent) {
   }
 
   // ---- Attempt to Open Directory ----
-  File dir = SD.open(path);
+  File dir = SD_MMC.open(path);
   if (!dir || !dir.isDirectory()) {
     Serial.printf("%sDirectory not found: %s\n", indentStr.c_str(), path);
     return;
@@ -897,7 +895,7 @@ void deleteFile(const char* filepath) {
 
   bool success = false;
   if (currentStorage == STORAGE_SD_CARD) {
-    success = SD.remove(filepath);
+    success = SD_MMC.remove(filepath);
   } else if (currentStorage == STORAGE_SPIFFS) {
     success = SPIFFS.remove(filepath);
   }
@@ -939,12 +937,12 @@ void formatStorage() {
           // ---- Format SD Card ----
           // Note: SD library doesn't have a direct format function
           // We'll erase all files instead
-          File root = SD.open("/");
+          File root = SD_MMC.open("/");
           if (root) {
             File file = root.openNextFile();
             while (file) {
               if (!file.isDirectory()) {
-                SD.remove(file.name());
+                SD_MMC.remove(file.name());
               }
               file.close();
               file = root.openNextFile();
@@ -1008,7 +1006,7 @@ void simulateCapture() {
 void collectFilesRecursive(const char* dirPath, std::vector<String>& files) {
   Serial.printf("[WebServer] Scanning SD directory: %s\n", dirPath);
 
-  File dir = SD.open(dirPath);
+  File dir = SD_MMC.open(dirPath);
   if (!dir || !dir.isDirectory()) {
     Serial.printf("[WebServer] Cannot open directory: %s\n", dirPath);
     return;
@@ -1029,7 +1027,7 @@ void collectFilesRecursive(const char* dirPath, std::vector<String>& files) {
       // Close the directory entry BEFORE recursing: the ESP32 SD library has a
       // limited number of open file handles. Releasing this handle first prevents
       // exhaustion in deep directory trees — the recursive call opens the
-      // subdirectory independently via SD.open(fullPath).
+      // subdirectory independently via SD_MMC.open(fullPath).
       entry.close();
       collectFilesRecursive(fullPath.c_str(), files);
     } else {
@@ -1253,7 +1251,8 @@ void setup() {
   Serial.printf("  TX pin: GPIO %d\n", UART_TX);
 
   // ---- Setup Trigger Input Pin ----
-  pinMode(TRIGGER_PIN, INPUT);
+  // Keep trigger stable/high when the remote controller is disconnected.
+  pinMode(TRIGGER_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(TRIGGER_PIN), triggerISR, FALLING);
   Serial.printf("Trigger pin ready (GPIO %d, active LOW)\n\n", TRIGGER_PIN);
 
