@@ -1,5 +1,6 @@
 #include "esp_camera.h"
 #include <WiFi.h>
+#include <WebServer.h>
 #include <SPIFFS.h>
 #include <SD.h>
 #include <FS.h>
@@ -72,6 +73,22 @@ StorageMode currentStorage = STORAGE_NONE;
 
 // Counter for failed captures (no filename, timeout, or invalid format)
 uint16_t failCounter = 0;
+
+// ============================================================================
+// WEB SERVER GLOBAL STATE
+// ============================================================================
+
+// HTTP server instance on port 80
+WebServer server(80);
+
+// Tracks whether the web server is currently active
+bool webServerRunning = false;
+
+// WiFi AP credentials
+// NOTE: Change AP_PASSWORD to a stronger value before deploying in the field.
+// The default "12345678" is intentionally simple for first-time setup only.
+static const char* AP_SSID     = "ESP32-CAM-Browser";
+static const char* AP_PASSWORD = "12345678";
 
 // ============================================================================
 // INTERRUPT SERVICE ROUTINE (ISR)
@@ -874,6 +891,186 @@ void simulateCapture() {
 }
 
 // ============================================================================
+// WEB SERVER - FILE COLLECTION HELPERS
+// ============================================================================
+
+// Recursively collects every file path from an SD card directory into a vector.
+// entry.name() returns only the basename on ESP32 SD, so the parent path is
+// prepended here — the same convention used by listFilesSDCard().
+void collectFilesRecursive(const char* dirPath, std::vector<String>& files) {
+  Serial.printf("[WebServer] Scanning SD directory: %s\n", dirPath);
+
+  File dir = SD.open(dirPath);
+  if (!dir || !dir.isDirectory()) {
+    Serial.printf("[WebServer] Cannot open directory: %s\n", dirPath);
+    return;
+  }
+
+  File entry = dir.openNextFile();
+  while (entry) {
+    // Build the full absolute path from the parent path and the basename
+    String fullPath;
+    if (strcmp(dirPath, "/") == 0) {
+      fullPath = String("/") + entry.name();
+    } else {
+      fullPath = String(dirPath) + "/" + entry.name();
+    }
+
+    if (entry.isDirectory()) {
+      Serial.printf("[WebServer]   Entering directory: %s\n", fullPath.c_str());
+      // Close the directory entry BEFORE recursing: the ESP32 SD library has a
+      // limited number of open file handles. Releasing this handle first prevents
+      // exhaustion in deep directory trees — the recursive call opens the
+      // subdirectory independently via SD.open(fullPath).
+      entry.close();
+      collectFilesRecursive(fullPath.c_str(), files);
+    } else {
+      Serial.printf("[WebServer]   Found file: %s\n", fullPath.c_str());
+      files.push_back(fullPath);
+      entry.close();
+    }
+
+    entry = dir.openNextFile();
+  }
+
+  dir.close();
+}
+
+// Collects every file path from SPIFFS.
+// SPIFFS entry.name() already returns the full absolute path (e.g. "/photo.jpg").
+void collectFilesSPIFFSFlat(std::vector<String>& files) {
+  Serial.println("[WebServer] Scanning SPIFFS filesystem...");
+
+  File root = SPIFFS.open("/");
+  if (!root) {
+    Serial.println("[WebServer] Cannot open SPIFFS root");
+    return;
+  }
+
+  File entry = root.openNextFile();
+  while (entry) {
+    if (!entry.isDirectory()) {
+      Serial.printf("[WebServer]   Found file: %s\n", entry.name());
+      files.push_back(String(entry.name()));
+    }
+    // Close before advancing — required to free the file handle
+    entry.close();
+    entry = root.openNextFile();
+  }
+
+  root.close();
+}
+
+// ============================================================================
+// WEB SERVER - ROUTE HANDLERS
+// ============================================================================
+
+// Serves a plain, unformatted HTML page that lists every file on storage
+// and provides a link to the live snapshot page.
+void handleHomePage() {
+  Serial.println("[WebServer] Home page requested — collecting file list...");
+
+  // Collect all file paths from whichever storage backend is active
+  std::vector<String> files;
+  if (currentStorage == STORAGE_SD_CARD) {
+    collectFilesRecursive("/", files);
+  } else if (currentStorage == STORAGE_SPIFFS) {
+    collectFilesSPIFFSFlat(files);
+  }
+
+  Serial.printf("[WebServer] Sending file list: %u file(s)\n", (unsigned)files.size());
+
+  // Build a minimal HTML page — no CSS, no JavaScript, no formatting
+  String html = "<!DOCTYPE html><html><body>\n";
+  html += "<p>Files on storage (" + String(files.size()) + "):</p>\n";
+  html += "<pre>\n";
+  for (const String& path : files) {
+    html += path + "\n";
+  }
+  html += "</pre>\n";
+  html += "<p><a href=\"/snapshot\">/snapshot</a> — live camera image</p>\n";
+  html += "</body></html>\n";
+
+  server.send(200, "text/html", html);
+}
+
+// Captures a live frame from the camera and streams it to the browser as JPEG.
+// The camera DMA buffer is written directly to the TCP socket and released
+// immediately — no file is written and no extra heap copy is made.
+void handleSnapshot() {
+  Serial.println("[WebServer] Snapshot requested — capturing frame...");
+
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("[WebServer] Snapshot: camera capture failed");
+    server.send(503, "text/plain", "Camera capture failed");
+    return;
+  }
+
+  Serial.printf("[WebServer] Snapshot: captured %u bytes\n", (unsigned)fb->len);
+
+  // Send headers first, then body as a single sendContent chunk.
+  // sendContent() appends body bytes to the already-open HTTP response
+  // without starting a new response — this is the correct ESP32 WebServer
+  // pattern for streaming pre-sized binary data.
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma",        "no-cache");
+  server.setContentLength(fb->len);
+  server.send(200, "image/jpeg", "");          // flush headers, empty body
+  server.sendContent((const char*)fb->buf, fb->len);  // stream body bytes
+
+  // MUST be called after every esp_camera_fb_get() to return the DMA slot
+  esp_camera_fb_return(fb);
+
+  Serial.println("[WebServer] Snapshot: response sent and frame buffer released");
+}
+
+// ============================================================================
+// WEB SERVER - SERVER MANAGEMENT
+// ============================================================================
+
+// Starts the WiFi access point and HTTP server, registering all routes.
+// Nothing in this function runs until the user types 'start'.
+void startWebServer() {
+  if (webServerRunning) {
+    Serial.println("Web server is already running.\n");
+    return;
+  }
+
+  // Start the access point
+  Serial.println("[WebServer] Starting WiFi Access Point...");
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  IPAddress ip = WiFi.softAPIP();
+  Serial.printf("[WebServer] AP started  SSID: %s  Password: %s  IP: %s\n",
+                AP_SSID, AP_PASSWORD, ip.toString().c_str());
+
+  // Register the two routes — only reachable after start()
+  server.on("/",         HTTP_GET, handleHomePage);
+  server.on("/snapshot", HTTP_GET, handleSnapshot);
+  Serial.println("[WebServer] Routes registered: /  /snapshot");
+
+  server.begin();
+  webServerRunning = true;
+
+  Serial.println("[WebServer] HTTP server listening on port 80");
+  Serial.printf("[WebServer] File list:     http://%s/\n",         ip.toString().c_str());
+  Serial.printf("[WebServer] Live snapshot: http://%s/snapshot\n\n", ip.toString().c_str());
+}
+
+// Stops the HTTP server and shuts down the WiFi access point.
+void stopWebServer() {
+  if (!webServerRunning) {
+    Serial.println("Web server is not running.\n");
+    return;
+  }
+
+  server.stop();
+  WiFi.softAPdisconnect(true);
+  webServerRunning = false;
+  Serial.println("Web server stopped.\n");
+}
+
+// ============================================================================
 // TERMINAL COMMANDS - PROCESS COMMAND
 // ============================================================================
 // Parses and executes terminal commands from user input.
@@ -905,6 +1102,12 @@ void processTerminalCommand(String command) {
   } else if (command == "capture") {
     // ---- Simulate Capture ----
     simulateCapture();
+  } else if (command == "start") {
+    // ---- Start Web Server ----
+    startWebServer();
+  } else if (command == "stop") {
+    // ---- Stop Web Server ----
+    stopWebServer();
   } else if (command == "help") {
     // ---- Show Help ----
     Serial.println("Available Commands:");
@@ -912,6 +1115,8 @@ void processTerminalCommand(String command) {
     Serial.println("  del <path>    - Delete a specific file");
     Serial.println("  fmt           - Format storage (with confirmation)");
     Serial.println("  capture       - Simulate trigger capture");
+    Serial.println("  start         - Start WiFi AP and web file browser");
+    Serial.println("  stop          - Stop web file browser and WiFi AP");
     Serial.println("  help          - Show this help message");
     Serial.println();
   } else if (command.length() > 0) {
@@ -984,6 +1189,13 @@ void loop() {
   if (termCommand.length() > 0) {
     processTerminalCommand(termCommand);
     Serial.print("> ");
+  }
+
+  // ---- Handle Incoming Web Requests ----
+  // Checked every loop iteration but only active after 'start' is typed.
+  // When the server is not running this branch costs a single boolean test.
+  if (webServerRunning) {
+    server.handleClient();
   }
 
   // ---- Check Trigger from Arduino ----
