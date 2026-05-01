@@ -33,169 +33,40 @@ ESP32-CAM Module
 
 ---
 
-## 2. ESP32-CAM BEHAVIOR SPECIFICATION
+## 2. ESP32-CAM COMMUNICATION BEHAVIOR
 
-### 2.1 Initialization Phase
+This section describes what the Arduino observes over the wire — the trigger mechanism, response messages, and error conditions. Internal ESP32-CAM implementation details (storage, camera hardware, boot sequence) are documented in the firmware README.
 
-On power-up or reset, the ESP32-CAM performs initialization in this order:
+### 2.1 Trigger Mechanism
 
-#### Step 1: Serial Monitor Setup
-- Initializes Serial @ 115200 baud
-- Used only for debugging output
-- Prints initialization status to developer console
-
-#### Step 2: UART Communication Setup
-- Initializes Serial2 @ 9600 baud
-- GPIO 14 (RX): Receives filepaths from Arduino
-- GPIO 15 (TX): Sends status messages to Arduino
-- Must complete before receiving data
-
-#### Step 3: GPIO Trigger Pin Configuration
-- Configures GPIO 13 as digital input
-- Attaches interrupt handler for FALLING edge (HIGH→LOW)
-- When Arduino pulls LOW, interrupt fires and sets captureFlag
-
-#### Step 4: Storage System Initialization
-- **SD Card (Primary Storage)**
-  - Attempts SPI initialization
-  - If successful: SD card is primary storage for all photos
-  - Supports real directory creation (e.g., /run01/)
-  
-- **SPIFFS (Fallback Storage)**
-  - Only initialized if SD card fails
-  - Built-in flash (~2-3 MB available)
-  - Used if SD card becomes unavailable
-  - Simulates directory structure with full path as filename
-
-#### Step 5: Camera Hardware Setup
-- Configures all GPIO pins for camera data/clock signals
-- Sets image format: JPEG
-- Resolution: 640x480 (VGA)
-- Quality: 10 (balance of quality vs file size)
-- Verifies camera module is responding
-
-#### Step 6: Ready State
-- Prints "System Ready" to console
-- Enters main loop
-- Waits for trigger signal from Arduino
-
----
-
-### 2.2 Photo Capture Sequence
-
-#### Trigger Phase
+The Arduino initiates a capture by pulling **GPIO 13** LOW for ~100 ms and then releasing it. The ESP32-CAM detects the falling edge and immediately begins the capture sequence.
 
 ```
-1. Arduino monitors its own sensors/logic
-2. When capture is needed, Arduino pulls GPIO 13 LOW (duration ~100ms)
-3. ESP32-CAM interrupt handler detects FALLING edge
-4. Sets captureFlag = true (interrupt exits immediately)
-5. Arduino releases GPIO 13 (returns to HIGH)
-6. Main loop detects captureFlag at next iteration
+Arduino: pull GPIO 13 LOW  (hold ~100ms)
+Arduino: release GPIO 13
+ESP32-CAM: detects edge → begins capture sequence
 ```
 
-#### Capture Phase
+### 2.2 Response Messages
 
-```
-1. Clear captureFlag (prevent multiple triggers)
-2. Send "READY" message to Arduino over Serial2
-3. Wait for filepath from Arduino (timeout: 5 seconds)
-   - Listen on GPIO 14 RX
-   - Accumulate characters until newline received
-   - Expected format: "/run01/12345.jpg"
-   - If timeout: send "ERR:NO_FILEPATH", return to idle
+After detecting the trigger, the ESP32-CAM sends one of the following messages over Serial2 (terminated with `\n`):
 
-4. Capture image from camera
-   - Call esp_camera_fb_get()
-   - Returns pointer to JPEG frame buffer
-   - If fails: send "ERR:CAPTURE_FAILED", return to idle
+| Message | When sent |
+|---------|-----------|
+| `READY` | Immediately after trigger detected — ESP32-CAM is ready to receive the filepath |
+| `OK:<filepath>` | Capture and save succeeded; `<filepath>` is the actual path where the image was stored |
+| `ERR:NO_FILEPATH` | Arduino did not send a filepath within 5 seconds of `READY`; image was saved to `/fail/XXXX.jpg` |
+| `ERR:CAPTURE_FAILED` | Camera capture or file write failed |
 
-5. Save to Primary Storage (SD Card)
-   - Extract directory from filepath (e.g., "/run01")
-   - Create directory if needed
-   - Open file: /run01/12345.jpg
-   - Write frame buffer to file
-   - Close file (flushes data)
-   - If successful: send "OK", return to idle
+The Arduino should use `response.startsWith("OK")` to detect success and extract the saved path after the `:` for logging.
 
-6. Fallback: If SD fails, try SPIFFS
-   - Initialize SPIFFS
-   - Open file (SPIFFS stores full path as filename)
-   - Write frame buffer to file
-   - Close file
-   - If successful: send "OK", return to idle
-   - If fails: send "ERR:CAPTURE_FAILED", return to idle
+### 2.3 Error Conditions
 
-7. Free frame buffer (return to camera module)
-8. Return to idle, wait for next trigger
-```
-
-#### Status Messages Sent to Arduino
-
-- **"READY"** - ESP32-CAM is prepared to receive filepath
-- **"OK"** - Photo captured and saved successfully
-- **"ERR:NO_FILEPATH"** - Timeout waiting for filename
-- **"ERR:CAPTURE_FAILED"** - Image capture or save failed
-
----
-
-### 2.3 File Storage Behavior
-
-#### SD Card Storage (Primary)
-- Real filesystem with directory support
-- Path: `/run01/12345.jpg` creates actual `/run01/` directory
-- Supports large files (SD card capacity)
-- Persistent across resets
-- Faster write speeds
-
-#### SPIFFS Storage (Fallback)
-- Flat filesystem (no real directories)
-- Path: `/run01/12345.jpg` stored as single filename
-- Limited space (~2-3 MB available)
-- Persistent across resets
-- Slower write speeds
-
-#### Storage Selection Logic
-```
-Attempt SD Card First
-├─ If available and write succeeds → Save to SD
-├─ If SD fails during write → Fall back to SPIFFS
-│  └─ If SPIFFS write succeeds → Save to SPIFFS
-│  └─ If SPIFFS write fails → Return error
-└─ If SD unavailable at startup → Use SPIFFS
-```
-
----
-
-### 2.4 Error Conditions and Recovery
-
-#### SD Card Unavailable at Startup
-- Falls back to SPIFFS immediately
-- User is notified via debug console
-- System continues to function with reduced capacity
-
-#### SD Card Fails During Write
-- Automatically attempts SPIFFS
-- Photo is not lost (writes to fallback storage)
-- Arduino receives "OK" or error based on fallback result
-
-#### Camera Capture Fails
-- Frame buffer is immediately released
-- Returns "ERR:CAPTURE_FAILED" to Arduino
-- Arduino can retry or skip this capture
-- System remains ready for next capture
-
-#### UART Timeout (No Filepath Received)
-- Waits exactly 5 seconds
-- If no data: returns "ERR:NO_FILEPATH"
-- Arduino can retry with new filepath
-- System returns to idle state
-
-#### Both Storage Systems Fail
-- Photo cannot be saved
-- Returns "ERR:CAPTURE_FAILED" to Arduino
-- System remains ready for next attempt
-- User should check storage hardware
+| Condition | Arduino receives | Arduino can |
+|-----------|-----------------|-------------|
+| No filepath sent within 5 s | `ERR:NO_FILEPATH` | Retry on next trigger |
+| Camera or storage failure | `ERR:CAPTURE_FAILED` | Retry or skip and continue |
+| No `READY` within 2 s of trigger | (silence / timeout) | Log error and retry trigger |
 
 ---
 
@@ -226,8 +97,9 @@ Serial.println("/run01/12345.jpg");
 
 // Step 4: Wait for status response
 String response = readMessage(5000);  // 5 second timeout
-if (response == "OK") {
-  // Photo saved successfully
+if (response.startsWith("OK")) {
+  // Photo saved successfully; extract the actual saved path after "OK:"
+  String savedPath = response.substring(3);
 } else if (response.startsWith("ERR")) {
   // Capture failed, handle error
 }
