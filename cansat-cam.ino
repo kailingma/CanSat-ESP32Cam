@@ -918,6 +918,10 @@ void collectFilesRecursive(const char* dirPath, std::vector<String>& files) {
 
     if (entry.isDirectory()) {
       Serial.printf("[WebServer]   Entering directory: %s\n", fullPath.c_str());
+      // Close the directory entry BEFORE recursing: the ESP32 SD library has a
+      // limited number of open file handles. Releasing this handle first prevents
+      // exhaustion in deep directory trees — the recursive call opens the
+      // subdirectory independently via SD.open(fullPath).
       entry.close();
       collectFilesRecursive(fullPath.c_str(), files);
     } else {
@@ -1005,13 +1009,15 @@ void handleSnapshot() {
 
   Serial.printf("[WebServer] Snapshot: captured %u bytes\n", (unsigned)fb->len);
 
+  // Send headers first, then body as a single sendContent chunk.
+  // sendContent() appends body bytes to the already-open HTTP response
+  // without starting a new response — this is the correct ESP32 WebServer
+  // pattern for streaming pre-sized binary data.
   server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   server.sendHeader("Pragma",        "no-cache");
   server.setContentLength(fb->len);
-  server.send(200, "image/jpeg", "");
-
-  WiFiClient client = server.client();
-  client.write(fb->buf, fb->len);
+  server.send(200, "image/jpeg", "");          // flush headers, empty body
+  server.sendContent((const char*)fb->buf, fb->len);  // stream body bytes
 
   // MUST be called after every esp_camera_fb_get() to return the DMA slot
   esp_camera_fb_return(fb);
