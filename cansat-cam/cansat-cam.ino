@@ -132,6 +132,13 @@ public:
     }
   }
 
+  void println(const char* text, bool includeInWebLog = false) {
+    if (text && text[0] != '\0') {
+      print(text, includeInWebLog);
+    }
+    print("\n", includeInWebLog);
+  }
+
   String snapshot() const {
     String out;
     out.reserve(used + 64);
@@ -1149,11 +1156,11 @@ void simulateCapture() {
 // entry.name() returns only the basename on ESP32 SD, so the parent path is
 // prepended here — the same convention used by listFilesSDCard().
 void collectFilesRecursive(const char* dirPath, std::vector<String>& files) {
-  Serial.printf("[WebServer] Scanning SD directory: %s\n", dirPath);
+  logs.printf(false, "[WebServer] Scanning SD directory: %s\n", dirPath);
 
   File dir = SD_MMC.open(dirPath);
   if (!dir || !dir.isDirectory()) {
-    Serial.printf("[WebServer] Cannot open directory: %s\n", dirPath);
+    logs.printf(true, "[WebServer] Cannot open directory: %s\n", dirPath);
     return;
   }
 
@@ -1174,7 +1181,7 @@ void collectFilesRecursive(const char* dirPath, std::vector<String>& files) {
     }
 
     if (entry.isDirectory()) {
-      Serial.printf("[WebServer]   Entering directory: %s\n", fullPath.c_str());
+      logs.printf(false, "[WebServer]   Entering directory: %s\n", fullPath.c_str());
       // Close the directory entry BEFORE recursing: the ESP32 SD library has a
       // limited number of open file handles. Releasing this handle first prevents
       // exhaustion in deep directory trees — the recursive call opens the
@@ -1182,7 +1189,7 @@ void collectFilesRecursive(const char* dirPath, std::vector<String>& files) {
       entry.close();
       collectFilesRecursive(fullPath.c_str(), files);
     } else {
-      Serial.printf("[WebServer]   Found file: %s\n", fullPath.c_str());
+      logs.printf(false, "[WebServer]   Found file: %s\n", fullPath.c_str());
       files.push_back(fullPath);
       entry.close();
     }
@@ -1196,11 +1203,11 @@ void collectFilesRecursive(const char* dirPath, std::vector<String>& files) {
 // Collects every file path from SPIFFS.
 // SPIFFS entry.name() already returns the full absolute path (e.g. "/photo.jpg").
 void collectFilesSPIFFSFlat(std::vector<String>& files) {
-  Serial.println("[WebServer] Scanning SPIFFS filesystem...");
+  logs.println("[WebServer] Scanning SPIFFS filesystem...");
 
   File root = SPIFFS.open("/");
   if (!root) {
-    Serial.println("[WebServer] Cannot open SPIFFS root");
+    logs.println("[WebServer] Cannot open SPIFFS root", true);
     return;
   }
 
@@ -1208,7 +1215,7 @@ void collectFilesSPIFFSFlat(std::vector<String>& files) {
   while (entry) {
     String fullPath = String(entry.name());
     if (!entry.isDirectory() && !isHiddenPath(fullPath)) {
-      Serial.printf("[WebServer]   Found file: %s\n", fullPath.c_str());
+      logs.printf(false, "[WebServer]   Found file: %s\n", fullPath.c_str());
       files.push_back(fullPath);
     }
     // Close before advancing — required to free the file handle
@@ -1348,44 +1355,44 @@ void handleFileFetch() {
 // Nothing in this function runs until the user types 'start'.
 void startWebServer() {
   if (webServerRunning) {
-    Serial.println("Web server is already running.\n");
+    logs.println("Web server is already running.");
     return;
   }
 
   // Start the access point
-  Serial.println("[WebServer] Starting WiFi Access Point...");
+  logs.println("[WebServer] Starting WiFi Access Point...", true);
   WiFi.softAP(AP_SSID, AP_PASSWORD);
   IPAddress ip = WiFi.softAPIP();
-  Serial.printf("[WebServer] AP started  SSID: %s  Password: %s  IP: %s\n",
-                AP_SSID, AP_PASSWORD, ip.toString().c_str());
+  logs.printf(true, "[WebServer] AP started  SSID: %s  Password: %s  IP: %s\n",
+              AP_SSID, AP_PASSWORD, ip.toString().c_str());
 
   // Register routes — only reachable after start()
   server.on("/",         HTTP_GET, handleHomePage);
   server.on("/snapshot", HTTP_GET, handleSnapshot);
   server.on("/logs",     HTTP_GET, handleLogs);
   server.onNotFound(handleFileFetch);
-  Serial.println("[WebServer] Routes registered: /  /snapshot  /logs");
+  logs.println("[WebServer] Routes registered: /  /snapshot  /logs", true);
 
   server.begin();
   webServerRunning = true;
 
-  Serial.println("[WebServer] HTTP server listening on port 80");
-  Serial.printf("[WebServer] File list:     http://%s/\n",         ip.toString().c_str());
-  Serial.printf("[WebServer] Live snapshot: http://%s/snapshot\n", ip.toString().c_str());
-  Serial.printf("[WebServer] Logs:          http://%s/logs\n\n", ip.toString().c_str());
+  logs.println("[WebServer] HTTP server listening on port 80", true);
+  logs.printf(true, "[WebServer] File list:     http://%s/\n", ip.toString().c_str());
+  logs.printf(true, "[WebServer] Live snapshot: http://%s/snapshot\n", ip.toString().c_str());
+  logs.printf(true, "[WebServer] Logs:          http://%s/logs\n", ip.toString().c_str());
 }
 
 // Stops the HTTP server and shuts down the WiFi access point.
 void stopWebServer() {
   if (!webServerRunning) {
-    Serial.println("Web server is not running.\n");
+    logs.println("Web server is not running.");
     return;
   }
 
   server.stop();
   WiFi.softAPdisconnect(true);
   webServerRunning = false;
-  Serial.println("Web server stopped.\n");
+  logs.println("Web server stopped.", true);
 }
 
 // ============================================================================
