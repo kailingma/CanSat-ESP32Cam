@@ -6,6 +6,7 @@
 #include <FS.h>
 #include <vector>
 #include <algorithm>
+#include <functional>
 
 // ============================================================================
 // CAMERA PIN DEFINITIONS
@@ -72,6 +73,7 @@ enum StorageMode {
 
 // Flag set by interrupt when trigger pin goes LOW
 volatile bool captureFlag = false;
+unsigned long ignoreTriggerUntilMs = 0;
 
 // Tracks which storage device is currently in use
 StorageMode currentStorage = STORAGE_NONE;
@@ -97,6 +99,80 @@ bool webServerRunning = false;
 // The default "12345678" is intentionally simple for first-time setup only.
 static const char* AP_SSID     = "ESP32-CAM-Browser";
 static const char* AP_PASSWORD = "12345678";
+
+// ============================================================================
+// PATH VISIBILITY HELPERS
+// ============================================================================
+// Hidden entries are any files or directories whose name starts with '.'
+// (e.g. ".secret", "/logs/.tmp/cap.jpg"). These are excluded from terminal
+// listings and from all web server file listing/fetch routes.
+
+bool isHiddenPath(const String& fullPath) {
+  int segmentStart = 0;
+  while (segmentStart < fullPath.length()) {
+    int nextSlash = fullPath.indexOf('/', segmentStart);
+    if (nextSlash == -1) {
+      nextSlash = fullPath.length();
+    }
+
+    if (nextSlash > segmentStart) {
+      String segment = fullPath.substring(segmentStart, nextSlash);
+      if (segment.length() > 0 && segment[0] == '.') {
+        return true;
+      }
+    }
+
+    segmentStart = nextSlash + 1;
+  }
+  return false;
+}
+
+bool isHiddenName(const char* name) {
+  return name != nullptr && name[0] == '.';
+}
+
+String getContentType(const String& path) {
+  if (path.endsWith(".jpg") || path.endsWith(".jpeg")) return "image/jpeg";
+  if (path.endsWith(".png")) return "image/png";
+  if (path.endsWith(".gif")) return "image/gif";
+  if (path.endsWith(".bmp")) return "image/bmp";
+  if (path.endsWith(".txt")) return "text/plain";
+  if (path.endsWith(".html")) return "text/html";
+  if (path.endsWith(".json")) return "application/json";
+  return "application/octet-stream";
+}
+
+String decodeUrlComponent(const String& input) {
+  // Minimal percent-decoder for request paths.
+  // We avoid framework-specific helpers here so the sketch compiles across
+  // Arduino-ESP32 core versions where urlDecode() may not exist.
+  String output;
+  output.reserve(input.length());
+
+  for (int i = 0; i < input.length(); i++) {
+    char c = input[i];
+
+    if (c == '+') {
+      output += ' ';
+      continue;
+    }
+
+    if (c == '%' && i + 2 < input.length()) {
+      char hi = input[i + 1];
+      char lo = input[i + 2];
+      if (isxdigit(hi) && isxdigit(lo)) {
+        char hex[3] = { hi, lo, '\0' };
+        output += (char)strtol(hex, nullptr, 16);
+        i += 2;
+        continue;
+      }
+    }
+
+    output += c;
+  }
+
+  return output;
+}
 
 // ============================================================================
 // INTERRUPT SERVICE ROUTINE (ISR)
@@ -765,18 +841,25 @@ void listFilesSDCard(const char* path, int indent) {
 
   // ---- Iterate Through All Files and Directories ----
   while (file) {
+    String entryName = String(file.name());
+    if (isHiddenName(file.name())) {
+      file.close();
+      file = dir.openNextFile();
+      continue;
+    }
+
     if (file.isDirectory()) {
       // ---- Display Directory Entry ----
-      Serial.printf("%s[DIR] %s/\n", indentStr.c_str(), file.name());
+      Serial.printf("%s[DIR] %s/\n", indentStr.c_str(), entryName.c_str());
       
       // ---- Build Full Path for Recursion ----
       char fullPath[128];
       if (strcmp(path, "/") == 0) {
         // If current path is root, just append filename
-        snprintf(fullPath, sizeof(fullPath), "/%s", file.name());
+        snprintf(fullPath, sizeof(fullPath), "/%s", entryName.c_str());
       } else {
         // Otherwise append to current path
-        snprintf(fullPath, sizeof(fullPath), "%s/%s", path, file.name());
+        snprintf(fullPath, sizeof(fullPath), "%s/%s", path, entryName.c_str());
       }
 
       // ---- Recursively List Subdirectory ----
@@ -784,7 +867,7 @@ void listFilesSDCard(const char* path, int indent) {
 
     } else {
       // ---- Display File Entry ----
-      Serial.printf("%s%s (%d bytes)\n", indentStr.c_str(), file.name(), file.size());
+      Serial.printf("%s%s (%d bytes)\n", indentStr.c_str(), entryName.c_str(), file.size());
     }
 
     // ---- Move to Next File ----
@@ -828,6 +911,11 @@ void listFilesSPIFFS() {
   File file = root.openNextFile();
   while (file && fileCount < 100) {
     String fullPath = file.name();
+    if (isHiddenPath(fullPath)) {
+      file.close();
+      file = root.openNextFile();
+      continue;
+    }
     
     // ---- Store File Info ----
     strncpy(files[fileCount].path, fullPath.c_str(), sizeof(files[fileCount].path) - 1);
@@ -934,22 +1022,43 @@ void formatStorage() {
         Serial.println("Formatting...");
         
         if (currentStorage == STORAGE_SD_CARD) {
-          // ---- Format SD Card ----
-          // Note: SD library doesn't have a direct format function
-          // We'll erase all files instead
-          File root = SD_MMC.open("/");
-          if (root) {
-            File file = root.openNextFile();
-            while (file) {
-              if (!file.isDirectory()) {
-                SD_MMC.remove(file.name());
-              }
-              file.close();
-              file = root.openNextFile();
+          std::vector<String> directories;
+          std::vector<String> files;
+
+          std::function<void(const char*)> scan = [&](const char* dirPath) {
+            File dir = SD_MMC.open(dirPath);
+            if (!dir || !dir.isDirectory()) {
+              return;
             }
-            root.close();
+
+            File entry = dir.openNextFile();
+            while (entry) {
+              String fullPath = (strcmp(dirPath, "/") == 0)
+                                  ? String("/") + entry.name()
+                                  : String(dirPath) + "/" + entry.name();
+
+              if (entry.isDirectory()) {
+                directories.push_back(fullPath);
+                entry.close();
+                scan(fullPath.c_str());
+              } else {
+                files.push_back(fullPath);
+                entry.close();
+              }
+              entry = dir.openNextFile();
+            }
+            dir.close();
+          };
+
+          scan("/");
+
+          for (const String& p : files) {
+            SD_MMC.remove(p);
           }
-          Serial.println("SD card contents cleared\n");
+          for (int i = directories.size() - 1; i >= 0; --i) {
+            SD_MMC.rmdir(directories[i]);
+          }
+          Serial.println("SD card contents erased recursively\n");
         } else if (currentStorage == STORAGE_SPIFFS) {
           // ---- Format SPIFFS ----
           SPIFFS.format();
@@ -978,6 +1087,11 @@ void formatStorage() {
 
 void simulateCapture() {
   Serial.println("Simulating trigger (no filename)...");
+
+  // Ignore any GPIO4 transition side-effects caused by camera/flash activity
+  // during this local simulation path.
+  ignoreTriggerUntilMs = millis() + 1000;
+  captureFlag = false;
   
   // ---- Capture Image ----
   camera_fb_t *fb = esp_camera_fb_get();
@@ -1022,6 +1136,12 @@ void collectFilesRecursive(const char* dirPath, std::vector<String>& files) {
       fullPath = String(dirPath) + "/" + entry.name();
     }
 
+    if (isHiddenPath(fullPath)) {
+      entry.close();
+      entry = dir.openNextFile();
+      continue;
+    }
+
     if (entry.isDirectory()) {
       Serial.printf("[WebServer]   Entering directory: %s\n", fullPath.c_str());
       // Close the directory entry BEFORE recursing: the ESP32 SD library has a
@@ -1055,9 +1175,10 @@ void collectFilesSPIFFSFlat(std::vector<String>& files) {
 
   File entry = root.openNextFile();
   while (entry) {
-    if (!entry.isDirectory()) {
-      Serial.printf("[WebServer]   Found file: %s\n", entry.name());
-      files.push_back(String(entry.name()));
+    String fullPath = String(entry.name());
+    if (!entry.isDirectory() && !isHiddenPath(fullPath)) {
+      Serial.printf("[WebServer]   Found file: %s\n", fullPath.c_str());
+      files.push_back(fullPath);
     }
     // Close before advancing — required to free the file handle
     entry.close();
@@ -1129,6 +1250,62 @@ void handleSnapshot() {
   Serial.println("[WebServer] Snapshot: response sent and frame buffer released");
 }
 
+void handleFileFetch() {
+  String path = server.uri();
+  // Normalize request path:
+  // 1) strip querystring, 2) decode %XX escapes, 3) force leading slash.
+  int q = path.indexOf('?');
+  if (q >= 0) {
+    path = path.substring(0, q);
+  }
+  path = decodeUrlComponent(path);
+  if (!path.startsWith("/")) {
+    path = "/" + path;
+  }
+  if (path.length() == 0) {
+    server.send(400, "text/plain", "Invalid path");
+    return;
+  }
+
+  if (isHiddenPath(path)) {
+    server.send(404, "text/plain", "Not found");
+    return;
+  }
+
+  if (path == "/" || path == "/snapshot") {
+    server.send(404, "text/plain", "Not found");
+    return;
+  }
+
+  fs::FS* fs = nullptr;
+  if (currentStorage == STORAGE_SD_CARD) {
+    fs = &SD_MMC;
+  } else if (currentStorage == STORAGE_SPIFFS) {
+    fs = &SPIFFS;
+  } else {
+    server.send(503, "text/plain", "No storage available");
+    return;
+  }
+
+  if (!fs->exists(path)) {
+    server.send(404, "text/plain", "File not found");
+    return;
+  }
+
+  File file = fs->open(path, FILE_READ);
+  if (!file || file.isDirectory()) {
+    server.send(404, "text/plain", "File not found");
+    if (file) {
+      file.close();
+    }
+    return;
+  }
+
+  String contentType = getContentType(path);
+  server.streamFile(file, contentType);
+  file.close();
+}
+
 // ============================================================================
 // WEB SERVER - SERVER MANAGEMENT
 // ============================================================================
@@ -1151,6 +1328,7 @@ void startWebServer() {
   // Register the two routes — only reachable after start()
   server.on("/",         HTTP_GET, handleHomePage);
   server.on("/snapshot", HTTP_GET, handleSnapshot);
+  server.onNotFound(handleFileFetch);
   Serial.println("[WebServer] Routes registered: /  /snapshot");
 
   server.begin();
@@ -1311,6 +1489,11 @@ void loop() {
 
   // ---- Check Trigger from Arduino ----
   if (captureFlag) {
+    if (millis() < ignoreTriggerUntilMs) {
+      captureFlag = false;
+      return;
+    }
+
     // ---- Clear Trigger Flag ----
     captureFlag = false;
 
