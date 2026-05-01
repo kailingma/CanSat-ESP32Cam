@@ -1,10 +1,10 @@
 # CanSat-ESP32Cam
 
-ESP32-CAM firmware for the U-Hill Physineering Club CanSat project (2026). An Arduino pulls GPIO 13 LOW to trigger a photo capture; the ESP32-CAM saves the image to SD card (SPIFFS as fallback) and reports status back over UART.
+ESP32-CAM firmware for the U-Hill Physineering Club CanSat project (2026). An Arduino pulls GPIO 12 LOW to trigger a photo capture; the ESP32-CAM saves the image to SD card (SPIFFS as fallback) and reports status back over UART.
 
 ## How it works
 
-1. Arduino pulls **GPIO 13** LOW → interrupt fires on the ESP32-CAM
+1. Arduino pulls **GPIO 12** LOW → interrupt fires on the ESP32-CAM
 2. ESP32-CAM sends `READY` over Serial2
 3. Arduino sends the target filepath (e.g. `/run01/00042.jpg`) over Serial2
 4. ESP32-CAM captures the image and saves it; replies `OK` or an `ERR:…` message
@@ -13,10 +13,10 @@ ESP32-CAM firmware for the U-Hill Physineering Club CanSat project (2026). An Ar
 
 | Pin | Role |
 |-----|------|
-| GPIO 13 | Trigger input — Arduino pulls LOW to request capture |
+| GPIO 12 | Trigger input — Arduino pulls LOW to request capture |
 | GPIO 14 | Serial2 RX — receives filepath from Arduino |
 | GPIO 15 | Serial2 TX — sends status messages to Arduino |
-| GPIO 5  | SD card SPI chip-select |
+| GPIO 13 | SD card SPI chip-select (onboard microSD) |
 | GPIO 0  | Camera XCLK |
 | GPIO 26 | Camera SIOD (I²C SDA) |
 | GPIO 27 | Camera SIOC (I²C SCL) |
