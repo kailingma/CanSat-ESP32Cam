@@ -205,41 +205,6 @@ String getContentType(const String& path) {
   return "application/octet-stream";
 }
 
-// Decodes percent-encoded URL path text (e.g. "%20" -> space).
-// Also maps '+' to space for compatibility with simple clients.
-String urlDecode(const String& input) {
-  String output;
-  output.reserve(input.length());
-
-  for (size_t i = 0; i < input.length(); i++) {
-    char c = input[i];
-    if (c == '%' && i + 2 < input.length()) {
-      char hi = input[i + 1];
-      char lo = input[i + 2];
-      auto hexToNibble = [](char v) -> int {
-        if (v >= '0' && v <= '9') return v - '0';
-        if (v >= 'A' && v <= 'F') return v - 'A' + 10;
-        if (v >= 'a' && v <= 'f') return v - 'a' + 10;
-        return -1;
-      };
-      int h = hexToNibble(hi);
-      int l = hexToNibble(lo);
-      if (h >= 0 && l >= 0) {
-        output += char((h << 4) | l);
-        i += 2;
-        continue;
-      }
-    }
-
-    if (c == '+') {
-      output += ' ';
-    } else {
-      output += c;
-    }
-  }
-  return output;
-}
-
 // ============================================================================
 // INTERRUPT SERVICE ROUTINE (ISR)
 // ============================================================================
@@ -1327,7 +1292,8 @@ void handleFileFetch() {
   if (q >= 0) {
     path = path.substring(0, q);
   }
-  path = urlDecode(path);
+  // Use WebServer's built-in decoder (modern equivalent to legacy helpers).
+  path = server.urlDecode(path);
   if (!path.startsWith("/")) {
     path = "/" + path;
   }
