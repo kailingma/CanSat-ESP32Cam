@@ -39,16 +39,22 @@
 // ============================================================================
 // These pins connect to the remote Arduino controller.
 
-#define TRIGGER_PIN       13    // Input pin: Arduino pulls LOW to request photo capture
+#define TRIGGER_PIN       12    // Input pin: Arduino pulls LOW to request photo capture
 #define UART_RX           14    // Serial2 RX: receives filename from Arduino
 #define UART_TX           15    // Serial2 TX: sends status messages back to Arduino
 
 // ============================================================================
 // SD CARD PIN DEFINITIONS
 // ============================================================================
-// These pins connect to the SD card module via SPI.
+// On the AI-Thinker ESP32-CAM the onboard microSD uses fixed SPI pins:
+//   SCK=GPIO14, MISO=GPIO2, MOSI=GPIO15, CS=GPIO13
+// IMPORTANT: GPIO5 is used by the camera data bus (Y2) on this board, so it
+// must NOT be used as SD CS.
 
-#define SD_CS             5     // Chip select pin for SD card SPI
+#define SD_CS             13    // Chip select pin for SD card SPI (AI-Thinker)
+
+// Dedicated SPI bus instance for the SD card (keeps SD off the default VSPI).
+static SPIClass sdSPI(HSPI);
 
 // ============================================================================
 // STORAGE MODE ENUMERATION
@@ -73,6 +79,9 @@ StorageMode currentStorage = STORAGE_NONE;
 
 // Counter for failed captures (no filename, timeout, or invalid format)
 uint16_t failCounter = 0;
+
+// Next auto-increment number for SPIFFS camera roll (/NNNN.jpg)
+uint16_t spiffsImageCounter = 1;
 
 // ============================================================================
 // WEB SERVER GLOBAL STATE
@@ -116,7 +125,8 @@ void IRAM_ATTR triggerISR() {
 bool initSDCard() {
   // ---- Attempt SD Card Initialization ----
   // SD.begin() initializes SPI communication with the SD card
-  if (!SD.begin(SD_CS)) {
+  sdSPI.begin(14 /* SCK */, 2 /* MISO */, 15 /* MOSI */, SD_CS /* CS */);
+  if (!SD.begin(SD_CS, sdSPI)) {
     Serial.println("SD card initialization failed");
     return false;
   }
@@ -274,6 +284,57 @@ void initializeFailCounter() {
 }
 
 // ============================================================================
+// SPIFFS IMAGE COUNTER INITIALIZATION
+// ============================================================================
+// Scans SPIFFS for files matching /NNNN.jpg (at root) and initializes
+// spiffsImageCounter to the next available number.
+
+uint16_t getNextSPIFFSImageNumber() {
+  if (currentStorage != STORAGE_SPIFFS) {
+    return 1;
+  }
+
+  uint16_t maxFound = 0;
+  File root = SPIFFS.open("/");
+  if (!root) {
+    return 1;
+  }
+
+  File file = root.openNextFile();
+  while (file) {
+    if (!file.isDirectory()) {
+      String filename = file.name();
+      // Root files look like "/0001.jpg".
+      if (filename.length() == 9 && filename[0] == '/' && filename.endsWith(".jpg")) {
+        String numberPart = filename.substring(1, 5);
+        bool isValidNumber = true;
+        for (int i = 0; i < 4; i++) {
+          if (!isdigit(numberPart[i])) {
+            isValidNumber = false;
+            break;
+          }
+        }
+        if (isValidNumber) {
+          uint16_t fileNumber = numberPart.toInt();
+          if (fileNumber > maxFound) {
+            maxFound = fileNumber;
+          }
+        }
+      }
+    }
+    file.close();
+    file = root.openNextFile();
+  }
+  root.close();
+
+  uint16_t next = maxFound + 1;
+  if (next > 9999) {
+    next = 1;
+  }
+  return next;
+}
+
+// ============================================================================
 // FILEPATH VALIDATION FUNCTION
 // ============================================================================
 // Validates that a received filepath matches expected format.
@@ -375,15 +436,24 @@ bool captureAndSave(const char* filepath) {
     return false;
   }
 
-  // ---- Validate Filepath Format ----
+  // ---- SPIFFS naming behavior ----
+  // SPIFFS is treated as a flat "camera roll": any requested filename is
+  // ignored and we always auto-increment to the next available NNNN.jpg.
+  if (currentStorage == STORAGE_SPIFFS) {
+    bool success = captureAndSaveAutoIncrementSPIFFS(fb);
+    esp_camera_fb_return(fb);
+    return success;
+  }
+
+  // ---- Validate Filepath Format (SD card only) ----
   if (!isValidFilepath(filepath)) {
     Serial.printf("Invalid filepath format: %s\n", filepath);
     Serial.println("Saving to failure fallback location");
-    
+
     // ---- Save to Failure Fallback ----
     bool success = captureAndSaveFailure(fb);
     esp_camera_fb_return(fb);
-    
+
     return success;
   }
 
@@ -436,6 +506,44 @@ bool captureAndSave(const char* filepath) {
 
   esp_camera_fb_return(fb);
   return success;
+}
+
+// ============================================================================
+// SPIFFS AUTO-INCREMENT SAVE
+// ============================================================================
+// When SPIFFS is the active backend, ignore the requested filename and instead
+// save as /NNNN.jpg where NNNN is one higher than the highest existing number.
+
+bool captureAndSaveAutoIncrementSPIFFS(camera_fb_t *fb) {
+  // Use cached counter (initialized at boot, updated after each save).
+  // This avoids re-scanning SPIFFS on every capture.
+  uint16_t nextNumber = spiffsImageCounter;
+  char path[16];
+  snprintf(path, sizeof(path), "/%04d.jpg", nextNumber);
+
+  Serial.printf("SPIFFS auto-increment save: %s\n", path);
+
+  File file = SPIFFS.open(path, FILE_WRITE);
+  if (!file) {
+    Serial.printf("SPIFFS open failed: %s\n", path);
+    return false;
+  }
+
+  size_t written = file.write(fb->buf, fb->len);
+  file.close();
+
+  if (written != fb->len) {
+    Serial.printf("SPIFFS write incomplete. Wrote %d of %d bytes\n", written, fb->len);
+    return false;
+  }
+
+  Serial.printf("Saved to SPIFFS: %s (%d bytes)\n", path, written);
+
+  spiffsImageCounter++;
+  if (spiffsImageCounter > 9999) {
+    spiffsImageCounter = 1;
+  }
+  return true;
 }
 
 // ============================================================================
@@ -1147,7 +1255,7 @@ void setup() {
   // ---- Setup Trigger Input Pin ----
   pinMode(TRIGGER_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(TRIGGER_PIN), triggerISR, FALLING);
-  Serial.println("Trigger pin ready (GPIO 13, active LOW)\n");
+  Serial.printf("Trigger pin ready (GPIO %d, active LOW)\n\n", TRIGGER_PIN);
 
   // ---- Initialize Storage Systems ----
   Serial.println("--- Storage Initialization ---");
@@ -1157,6 +1265,12 @@ void setup() {
     if (!initSPIFFS()) {
       Serial.println("ERROR: No storage available!");
     }
+  }
+
+  // ---- Initialize SPIFFS Auto-Increment Counter ----
+  if (currentStorage == STORAGE_SPIFFS) {
+    spiffsImageCounter = getNextSPIFFSImageNumber();
+    Serial.printf("SPIFFS image counter initialized to: %04d\n", spiffsImageCounter);
   }
 
   // ---- Initialize Fail Counter ----
@@ -1171,7 +1285,7 @@ void setup() {
   Serial.println("\n--- System Ready ---");
   Serial.println("Waiting for trigger from Arduino...");
   Serial.println("Arduino should:");
-  Serial.println("  1. Pull GPIO 13 to LOW");
+  Serial.printf("  1. Pull GPIO %d to LOW\n", TRIGGER_PIN);
   Serial.println("  2. Send filepath over UART (e.g., \"/run01/12345.jpg\")\n");
   Serial.println("Type 'help' for terminal commands\n");
   Serial.print("> ");
