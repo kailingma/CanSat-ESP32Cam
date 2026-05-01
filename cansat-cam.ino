@@ -99,6 +99,33 @@ static const char* AP_SSID     = "ESP32-CAM-Browser";
 static const char* AP_PASSWORD = "12345678";
 
 // ============================================================================
+// PATH VISIBILITY HELPERS
+// ============================================================================
+// Hidden entries are any files or directories whose name starts with '.'
+// (e.g. ".secret", "/logs/.tmp/cap.jpg"). These are excluded from terminal
+// listings and from all web server file listing/fetch routes.
+
+bool isHiddenPath(const String& fullPath) {
+  int segmentStart = 0;
+  while (segmentStart < fullPath.length()) {
+    int nextSlash = fullPath.indexOf('/', segmentStart);
+    if (nextSlash == -1) {
+      nextSlash = fullPath.length();
+    }
+
+    if (nextSlash > segmentStart) {
+      String segment = fullPath.substring(segmentStart, nextSlash);
+      if (segment.length() > 0 && segment[0] == '.') {
+        return true;
+      }
+    }
+
+    segmentStart = nextSlash + 1;
+  }
+  return false;
+}
+
+// ============================================================================
 // INTERRUPT SERVICE ROUTINE (ISR)
 // ============================================================================
 // This function is called when the trigger pin transitions from HIGH to LOW.
@@ -765,18 +792,25 @@ void listFilesSDCard(const char* path, int indent) {
 
   // ---- Iterate Through All Files and Directories ----
   while (file) {
+    String entryName = String(file.name());
+    if (entryName.startsWith(".")) {
+      file.close();
+      file = dir.openNextFile();
+      continue;
+    }
+
     if (file.isDirectory()) {
       // ---- Display Directory Entry ----
-      Serial.printf("%s[DIR] %s/\n", indentStr.c_str(), file.name());
+      Serial.printf("%s[DIR] %s/\n", indentStr.c_str(), entryName.c_str());
       
       // ---- Build Full Path for Recursion ----
       char fullPath[128];
       if (strcmp(path, "/") == 0) {
         // If current path is root, just append filename
-        snprintf(fullPath, sizeof(fullPath), "/%s", file.name());
+        snprintf(fullPath, sizeof(fullPath), "/%s", entryName.c_str());
       } else {
         // Otherwise append to current path
-        snprintf(fullPath, sizeof(fullPath), "%s/%s", path, file.name());
+        snprintf(fullPath, sizeof(fullPath), "%s/%s", path, entryName.c_str());
       }
 
       // ---- Recursively List Subdirectory ----
@@ -784,7 +818,7 @@ void listFilesSDCard(const char* path, int indent) {
 
     } else {
       // ---- Display File Entry ----
-      Serial.printf("%s%s (%d bytes)\n", indentStr.c_str(), file.name(), file.size());
+      Serial.printf("%s%s (%d bytes)\n", indentStr.c_str(), entryName.c_str(), file.size());
     }
 
     // ---- Move to Next File ----
@@ -828,6 +862,11 @@ void listFilesSPIFFS() {
   File file = root.openNextFile();
   while (file && fileCount < 100) {
     String fullPath = file.name();
+    if (isHiddenPath(fullPath)) {
+      file.close();
+      file = root.openNextFile();
+      continue;
+    }
     
     // ---- Store File Info ----
     strncpy(files[fileCount].path, fullPath.c_str(), sizeof(files[fileCount].path) - 1);
@@ -1022,6 +1061,12 @@ void collectFilesRecursive(const char* dirPath, std::vector<String>& files) {
       fullPath = String(dirPath) + "/" + entry.name();
     }
 
+    if (isHiddenPath(fullPath)) {
+      entry.close();
+      entry = dir.openNextFile();
+      continue;
+    }
+
     if (entry.isDirectory()) {
       Serial.printf("[WebServer]   Entering directory: %s\n", fullPath.c_str());
       // Close the directory entry BEFORE recursing: the ESP32 SD library has a
@@ -1055,9 +1100,10 @@ void collectFilesSPIFFSFlat(std::vector<String>& files) {
 
   File entry = root.openNextFile();
   while (entry) {
-    if (!entry.isDirectory()) {
-      Serial.printf("[WebServer]   Found file: %s\n", entry.name());
-      files.push_back(String(entry.name()));
+    String fullPath = String(entry.name());
+    if (!entry.isDirectory() && !isHiddenPath(fullPath)) {
+      Serial.printf("[WebServer]   Found file: %s\n", fullPath.c_str());
+      files.push_back(fullPath);
     }
     // Close before advancing — required to free the file handle
     entry.close();
@@ -1129,6 +1175,51 @@ void handleSnapshot() {
   Serial.println("[WebServer] Snapshot: response sent and frame buffer released");
 }
 
+void handleFileFetch() {
+  String path = server.uri();
+  if (path.length() == 0) {
+    server.send(400, "text/plain", "Invalid path");
+    return;
+  }
+
+  if (isHiddenPath(path)) {
+    server.send(404, "text/plain", "Not found");
+    return;
+  }
+
+  if (path == "/" || path == "/snapshot") {
+    server.send(404, "text/plain", "Not found");
+    return;
+  }
+
+  fs::FS* fs = nullptr;
+  if (currentStorage == STORAGE_SD_CARD) {
+    fs = &SD_MMC;
+  } else if (currentStorage == STORAGE_SPIFFS) {
+    fs = &SPIFFS;
+  } else {
+    server.send(503, "text/plain", "No storage available");
+    return;
+  }
+
+  if (!fs->exists(path)) {
+    server.send(404, "text/plain", "File not found");
+    return;
+  }
+
+  File file = fs->open(path, FILE_READ);
+  if (!file || file.isDirectory()) {
+    server.send(404, "text/plain", "File not found");
+    if (file) {
+      file.close();
+    }
+    return;
+  }
+
+  server.streamFile(file, "application/octet-stream");
+  file.close();
+}
+
 // ============================================================================
 // WEB SERVER - SERVER MANAGEMENT
 // ============================================================================
@@ -1151,6 +1242,7 @@ void startWebServer() {
   // Register the two routes — only reachable after start()
   server.on("/",         HTTP_GET, handleHomePage);
   server.on("/snapshot", HTTP_GET, handleSnapshot);
+  server.onNotFound(handleFileFetch);
   Serial.println("[WebServer] Routes registered: /  /snapshot");
 
   server.begin();
