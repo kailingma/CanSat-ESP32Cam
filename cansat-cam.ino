@@ -7,6 +7,7 @@
 #include <vector>
 #include <algorithm>
 #include <functional>
+#include <stdarg.h>
 
 // ============================================================================
 // CAMERA PIN DEFINITIONS
@@ -99,6 +100,68 @@ bool webServerRunning = false;
 // The default "12345678" is intentionally simple for first-time setup only.
 static const char* AP_SSID     = "ESP32-CAM-Browser";
 static const char* AP_PASSWORD = "12345678";
+
+// ============================================================================
+// LIGHTWEIGHT LOG BUFFER (FOR /logs WEB VIEW)
+// ============================================================================
+constexpr size_t LOG_BUFFER_SIZE = 4096;
+
+class LogBuffer {
+public:
+  void begin() { head = 0; used = 0; }
+
+  void print(const char* text, bool includeInWebLog = false) {
+    if (!text) return;
+    if (Serial) {
+      Serial.print(text);
+    }
+    if (includeInWebLog) {
+      append(text);
+    }
+  }
+
+  void printf(bool includeInWebLog, const char* fmt, ...) {
+    if (!fmt) return;
+    char line[192];
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(line, sizeof(line), fmt, args);
+    va_end(args);
+    if (n > 0) {
+      print(line, includeInWebLog);
+    }
+  }
+
+  String snapshot() const {
+    String out;
+    out.reserve(used + 64);
+    out += "ESP32-CAM recent log buffer\n";
+    out += "---------------------------\n";
+    size_t start = (head + LOG_BUFFER_SIZE - used) % LOG_BUFFER_SIZE;
+    for (size_t i = 0; i < used; i++) {
+      out += buffer[(start + i) % LOG_BUFFER_SIZE];
+    }
+    if (used == 0) {
+      out += "(empty)\n";
+    }
+    return out;
+  }
+
+private:
+  void append(const char* text) {
+    while (*text) {
+      buffer[head] = *text++;
+      head = (head + 1) % LOG_BUFFER_SIZE;
+      if (used < LOG_BUFFER_SIZE) used++;
+    }
+  }
+
+  char buffer[LOG_BUFFER_SIZE];
+  size_t head = 0;
+  size_t used = 0;
+};
+
+LogBuffer logs;
 
 // ============================================================================
 // PATH VISIBILITY HELPERS
@@ -1163,7 +1226,7 @@ void collectFilesSPIFFSFlat(std::vector<String>& files) {
 // Serves a plain, unformatted HTML page that lists every file on storage
 // and provides a link to the live snapshot page.
 void handleHomePage() {
-  Serial.println("[WebServer] Home page requested — collecting file list...");
+  logs.print("[WebServer] Home page requested — collecting file list...\n", true);
 
   // Collect all file paths from whichever storage backend is active
   std::vector<String> files;
@@ -1173,7 +1236,7 @@ void handleHomePage() {
     collectFilesSPIFFSFlat(files);
   }
 
-  Serial.printf("[WebServer] Sending file list: %u file(s)\n", (unsigned)files.size());
+  logs.printf(true, "[WebServer] Sending file list: %u file(s)\n", (unsigned)files.size());
 
   // Build a minimal HTML page — no CSS, no JavaScript, no formatting
   String html = "<!DOCTYPE html><html><body>\n";
@@ -1187,20 +1250,25 @@ void handleHomePage() {
   server.send(200, "text/html", html);
 }
 
+// Serves the fixed-size in-memory log buffer as plain text.
+void handleLogs() {
+  server.send(200, "text/plain", logs.snapshot());
+}
+
 // Captures a live frame from the camera and streams it to the browser as JPEG.
 // The camera DMA buffer is written directly to the TCP socket and released
 // immediately — no file is written and no extra heap copy is made.
 void handleSnapshot() {
-  Serial.println("[WebServer] Snapshot requested — capturing frame...");
+  logs.print("[WebServer] Snapshot requested — capturing frame...\n", true);
 
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
-    Serial.println("[WebServer] Snapshot: camera capture failed");
+    logs.print("[WebServer] Snapshot: camera capture failed\n", true);
     server.send(503, "text/plain", "Camera capture failed");
     return;
   }
 
-  Serial.printf("[WebServer] Snapshot: captured %u bytes\n", (unsigned)fb->len);
+  logs.printf(true, "[WebServer] Snapshot: captured %u bytes\n", (unsigned)fb->len);
 
   // Send headers first, then body as a single sendContent chunk.
   // sendContent() appends body bytes to the already-open HTTP response
@@ -1215,7 +1283,7 @@ void handleSnapshot() {
   // MUST be called after every esp_camera_fb_get() to return the DMA slot
   esp_camera_fb_return(fb);
 
-  Serial.println("[WebServer] Snapshot: response sent and frame buffer released");
+  logs.print("[WebServer] Snapshot: response sent and frame buffer released\n", true);
 }
 
 void handleFileFetch() {
@@ -1291,18 +1359,20 @@ void startWebServer() {
   Serial.printf("[WebServer] AP started  SSID: %s  Password: %s  IP: %s\n",
                 AP_SSID, AP_PASSWORD, ip.toString().c_str());
 
-  // Register the two routes — only reachable after start()
+  // Register routes — only reachable after start()
   server.on("/",         HTTP_GET, handleHomePage);
   server.on("/snapshot", HTTP_GET, handleSnapshot);
+  server.on("/logs",     HTTP_GET, handleLogs);
   server.onNotFound(handleFileFetch);
-  Serial.println("[WebServer] Routes registered: /  /snapshot");
+  Serial.println("[WebServer] Routes registered: /  /snapshot  /logs");
 
   server.begin();
   webServerRunning = true;
 
   Serial.println("[WebServer] HTTP server listening on port 80");
   Serial.printf("[WebServer] File list:     http://%s/\n",         ip.toString().c_str());
-  Serial.printf("[WebServer] Live snapshot: http://%s/snapshot\n\n", ip.toString().c_str());
+  Serial.printf("[WebServer] Live snapshot: http://%s/snapshot\n", ip.toString().c_str());
+  Serial.printf("[WebServer] Logs:          http://%s/logs\n\n", ip.toString().c_str());
 }
 
 // Stops the HTTP server and shuts down the WiFi access point.
@@ -1381,6 +1451,7 @@ void processTerminalCommand(String command) {
 void setup() {
   // ---- Initialize Debug Serial Monitor ----
   Serial.begin(115200);
+  logs.begin();
   delay(1000);
 
   Serial.println("\n\nESP32-CAM Remote Capture System with SD Card");
