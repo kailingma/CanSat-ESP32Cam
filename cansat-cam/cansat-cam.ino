@@ -1292,7 +1292,7 @@ void handleFileFetch() {
   if (q >= 0) {
     path = path.substring(0, q);
   }
-  path = urlDecode(path);
+  path = server.urlDecode(path);
   if (!path.startsWith("/")) {
     path = "/" + path;
   }
