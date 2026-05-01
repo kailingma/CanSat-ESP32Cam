@@ -142,35 +142,6 @@ String getContentType(const String& path) {
   return "application/octet-stream";
 }
 
-String decodeUrlComponent(const String& input) {
-  String output;
-  output.reserve(input.length());
-
-  for (int i = 0; i < input.length(); i++) {
-    char c = input[i];
-
-    if (c == '+') {
-      output += ' ';
-      continue;
-    }
-
-    if (c == '%' && i + 2 < input.length()) {
-      char hi = input[i + 1];
-      char lo = input[i + 2];
-      if (isxdigit(hi) && isxdigit(lo)) {
-        char hex[3] = { hi, lo, '\0' };
-        output += (char)strtol(hex, nullptr, 16);
-        i += 2;
-        continue;
-      }
-    }
-
-    output += c;
-  }
-
-  return output;
-}
-
 // ============================================================================
 // INTERRUPT SERVICE ROUTINE (ISR)
 // ============================================================================
@@ -1253,7 +1224,7 @@ void handleFileFetch() {
   if (q >= 0) {
     path = path.substring(0, q);
   }
-  path = decodeUrlComponent(path);
+  path = urlDecode(path);
   if (!path.startsWith("/")) {
     path = "/" + path;
   }
