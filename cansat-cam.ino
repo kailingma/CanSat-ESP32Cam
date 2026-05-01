@@ -73,6 +73,10 @@ enum StorageMode {
 
 // Flag set by interrupt when trigger pin goes LOW
 volatile bool captureFlag = false;
+volatile uint32_t lastTriggerMicros = 0;
+
+static const uint32_t TRIGGER_DEBOUNCE_US = 250000;   // 250 ms
+static const uint32_t TRIGGER_REARM_WAIT_MS = 1500;   // wait for line release
 
 // Tracks which storage device is currently in use
 StorageMode currentStorage = STORAGE_NONE;
@@ -180,7 +184,11 @@ String decodeUrlComponent(const String& input) {
 // IRAM_ATTR places this function in fast RAM for quick execution.
 
 void IRAM_ATTR triggerISR() {
-  captureFlag = true;  // Signal main loop to capture a photo
+  uint32_t nowUs = micros();
+  if (nowUs - lastTriggerMicros > TRIGGER_DEBOUNCE_US) {
+    lastTriggerMicros = nowUs;
+    captureFlag = true;  // Signal main loop to capture a photo
+  }
 }
 
 // ============================================================================
@@ -1481,6 +1489,15 @@ void loop() {
     // ---- Clear Trigger Flag ----
     captureFlag = false;
 
+    // ---- Reject short glitches ----
+    delay(20);
+    if (digitalRead(TRIGGER_PIN) != LOW) {
+      Serial.println("\n[Trigger ignored: glitch/noise]");
+      Serial.print("\n> ");
+      delay(10);
+      return;
+    }
+
     Serial.println("\n[Trigger detected from Arduino]");
     Serial2.println("READY");
 
@@ -1524,6 +1541,12 @@ void loop() {
     }
 
     Serial.print("\n> ");
+
+    // ---- Rearm only after trigger line is released HIGH ----
+    unsigned long releaseDeadline = millis() + TRIGGER_REARM_WAIT_MS;
+    while (digitalRead(TRIGGER_PIN) == LOW && millis() < releaseDeadline) {
+      delay(5);
+    }
   }
 
   // ---- Prevent Tight Loop ----
